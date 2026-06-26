@@ -1,21 +1,23 @@
-"""Video display with an interactive detection-region editor.
+"""Video display with an interactive, multi-region detection-region editor.
 
 The video is shown via a :class:`QGraphicsVideoItem` inside a graphics view so
-that overlay items (the region outline) reliably composite on top of the video
-regardless of the multimedia backend.
+overlay items (the region outlines) reliably composite on top of the video
+regardless of the multimedia backend. The video item is sized to the video's
+*native* resolution, so scene coordinates are exactly video-pixel coordinates —
+each region maps to one of DVR-Scan's ``-a X0 Y0 X1 Y1 …`` arguments with no
+further conversion.
 
-The video item is sized to the video's *native* resolution, so scene
-coordinates are exactly video-pixel coordinates — the region can be reported to
-DVR-Scan's ``-a X0 Y0 X1 Y1 …`` argument without any further mapping.
+The editor is tool-based, like a simple drawing program:
 
-Two region shapes are supported:
+* **pointer** (default) — drag the corner handles of any region to adjust it.
+* **rectangle** — click two opposite corners; the box previews while you move.
+* **polygon** — click each vertex (the next edge previews live); double-click,
+  or click the first vertex, to close. Right-click removes the last vertex.
+* **delete** — click a region to remove it.
 
-* **rectangle** — press, drag, release.
-* **polygon** — click to add each vertex; double-click, or click near the first
-  vertex, to close. Right-click removes the last vertex; Esc cancels.
-
-The region is drawn as a dashed outline with no fill. It can be deleted
-entirely, or disabled (kept on screen, dimmed, but excluded from the scan).
+Finishing a drawing, or pressing Esc, returns to the pointer tool. Regions are
+drawn as dashed outlines with no fill, and the whole set can be enabled or
+disabled (kept on screen but excluded from the scan).
 """
 
 from __future__ import annotations
@@ -32,29 +34,38 @@ from PySide6.QtGui import (
 )
 from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
 from PySide6.QtWidgets import (
+    QGraphicsItem,
     QGraphicsPolygonItem,
+    QGraphicsRectItem,
     QGraphicsScene,
     QGraphicsView,
 )
 
-MODE_RECTANGLE = "rectangle"
-MODE_POLYGON = "polygon"
+TOOL_POINTER = "pointer"
+TOOL_RECTANGLE = "rectangle"
+TOOL_POLYGON = "polygon"
+TOOL_DELETE = "delete"
+
+_KIND_KEY = 0  # QGraphicsItem data key storing a region's creation kind
 
 
 def _dashed_pen(color: QColor) -> QPen:
     pen = QPen(color, 2, Qt.PenStyle.DashLine)
-    pen.setCosmetic(True)  # keep a constant 2px dash regardless of view scaling
+    pen.setCosmetic(True)  # constant 2px dash regardless of view scaling
     return pen
 
 
 class VideoView(QGraphicsView):
-    """A graphics-view based video display supporting one editable region.
+    """Graphics-view video display supporting several editable regions.
 
     Signals:
-        regionChanged(bool): emitted with whether a usable region now exists.
+        regionsChanged(): a region was added, edited, or removed.
+        toolReset():       the active tool reverted to the pointer (so the
+                           owning toolbar can re-check the pointer button).
     """
 
-    regionChanged = Signal(bool)
+    regionsChanged = Signal()
+    toolReset = Signal()
 
     _ACTIVE_PEN = _dashed_pen(QColor(255, 196, 0))
     _DISABLED_PEN = _dashed_pen(QColor(150, 150, 150))
@@ -71,46 +82,43 @@ class VideoView(QGraphicsView):
         self.setBackgroundBrush(QColor("black"))
         self.setMinimumSize(480, 300)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setMouseTracking(True)
 
         self.video_item = QGraphicsVideoItem()
         self.video_item.setPos(0, 0)
         self._scene.addItem(self.video_item)
         self.video_item.nativeSizeChanged.connect(self._on_native_size_changed)
 
-        self._region_item: QGraphicsPolygonItem | None = None
-        self._region_kind: str | None = None  # of the *committed* region
+        self._regions: list[QGraphicsPolygonItem] = []
+        self._handles: list[QGraphicsRectItem] = []
         self._region_enabled = True
-        self._mode = MODE_RECTANGLE
-        self._edit_mode = False
-        self._video_size = QRectF()  # 0,0,w,h in pixels once known
+        self._tool = TOOL_POINTER
+        self._video_size = QRectF()  # 0,0,w,h once known
 
-        # Rectangle drag / polygon construction state.
-        self._rect_origin: QPointF | None = None
+        # In-progress drawing / editing state.
+        self._draft_item: QGraphicsPolygonItem | None = None
+        self._rect_first: QPointF | None = None
         self._poly_points: list[QPointF] = []
+        self._drag_item: QGraphicsPolygonItem | None = None
+        self._drag_vertex = -1
 
     # ---- configuration ----------------------------------------------------
 
-    def set_mode(self, mode: str) -> None:
-        if mode not in (MODE_RECTANGLE, MODE_POLYGON):
+    def set_tool(self, tool: str) -> None:
+        if tool not in (TOOL_POINTER, TOOL_RECTANGLE, TOOL_POLYGON, TOOL_DELETE):
             return
-        if mode != self._mode:
-            self._mode = mode
-            self._cancel_in_progress()
-            self.clear_region()  # a half-defined shape of another kind is moot
+        self._cancel_draft()
+        self._tool = tool
+        self._update_cursor()
+        self._refresh_handles()
 
-    def set_edit_mode(self, enabled: bool) -> None:
-        """Enable drawing of the detection region."""
-        self._edit_mode = enabled and not self._video_size.isEmpty()
-        if not self._edit_mode:
-            self._cancel_in_progress()
-        self.setCursor(
-            Qt.CursorShape.CrossCursor if self._edit_mode else Qt.CursorShape.ArrowCursor
-        )
+    def tool(self) -> str:
+        return self._tool
 
     def set_region_enabled(self, enabled: bool) -> None:
-        """Toggle whether the region applies to the scan (and dim it if not)."""
+        """Toggle whether the regions apply to the scan (and dim them if not)."""
         self._region_enabled = enabled
-        self._apply_pen()
+        self._apply_pens()
 
     def is_region_enabled(self) -> bool:
         return self._region_enabled
@@ -121,26 +129,23 @@ class VideoView(QGraphicsView):
 
     # ---- region state -----------------------------------------------------
 
-    def clear_region(self) -> None:
-        self._cancel_in_progress()
-        if self._region_item is not None:
-            self._scene.removeItem(self._region_item)
-            self._region_item = None
-            self._region_kind = None
-            self.regionChanged.emit(False)
+    def has_regions(self) -> bool:
+        return bool(self._regions)
 
-    def has_region(self) -> bool:
-        return self._region_item is not None
+    def region_count(self) -> int:
+        return len(self._regions)
 
-    def region_kind(self) -> str | None:
-        return self._region_kind
+    def region_kinds(self) -> list[str]:
+        return [item.data(_KIND_KEY) for item in self._regions]
 
-    def region_points(self) -> list[tuple[int, int]] | None:
-        """Return the committed region's vertices as integer (x, y) points."""
-        if self._region_item is None:
-            return None
-        pts = [(round(p.x()), round(p.y())) for p in self._region_item.polygon()]
-        return pts if len(pts) >= 3 else None
+    def regions_points(self) -> list[list[tuple[int, int]]]:
+        """Each region as a list of integer (x, y) vertices (≥3 points only)."""
+        result = []
+        for item in self._regions:
+            pts = [(round(p.x()), round(p.y())) for p in item.polygon()]
+            if len(pts) >= 3:
+                result.append(pts)
+        return result
 
     # ---- video sizing -----------------------------------------------------
 
@@ -148,11 +153,11 @@ class VideoView(QGraphicsView):
         self.set_video_size(size)
 
     def set_video_size(self, size) -> None:
-        """Set the source resolution (in pixels).
+        """Set the source resolution (in pixels). Idempotent.
 
-        Called both from the video item's ``nativeSizeChanged`` (once a frame is
+        Fed both from the video item's ``nativeSizeChanged`` (once a frame is
         presented) and from the player's metadata (available earlier, and the
-        only source under platforms that never present a frame). Idempotent.
+        only source on platforms that never present a frame).
         """
         if size is None or size.isEmpty():
             return
@@ -162,8 +167,8 @@ class VideoView(QGraphicsView):
         self._video_size = new_size
         self.video_item.setSize(size)
         self._scene.setSceneRect(self._video_size)
-        # A region from a previous (differently-sized) video is no longer valid.
-        self.clear_region()
+        # Regions from a previous (differently-sized) video are no longer valid.
+        self._clear_all_regions()
         self._fit()
 
     def resizeEvent(self, event) -> None:
@@ -174,168 +179,298 @@ class VideoView(QGraphicsView):
         if not self._video_size.isEmpty():
             self.fitInView(self._video_size, Qt.AspectRatioMode.KeepAspectRatio)
 
-    # ---- drawing helpers --------------------------------------------------
+    # ---- helpers ----------------------------------------------------------
 
-    def _clamp_to_video(self, point: QPointF) -> QPointF:
+    def _clamp(self, point: QPointF) -> QPointF:
         x = min(max(point.x(), 0.0), self._video_size.width())
         y = min(max(point.y(), 0.0), self._video_size.height())
         return QPointF(x, y)
-
-    def _ensure_item(self) -> QGraphicsPolygonItem:
-        if self._region_item is None:
-            self._region_item = QGraphicsPolygonItem()
-            self._region_item.setBrush(QBrush(Qt.BrushStyle.NoBrush))  # outline only
-            self._scene.addItem(self._region_item)
-        self._apply_pen()
-        return self._region_item
-
-    def _apply_pen(self) -> None:
-        if self._region_item is not None:
-            self._region_item.setPen(
-                self._ACTIVE_PEN if self._region_enabled else self._DISABLED_PEN
-            )
 
     def _scene_threshold(self, view_pixels: float) -> float:
         scale = self.transform().m11()
         return view_pixels / scale if scale else view_pixels
 
-    def _cancel_in_progress(self) -> None:
-        """Discard an unfinished rectangle drag or polygon."""
-        was_building = self._rect_origin is not None or bool(self._poly_points)
-        self._rect_origin = None
+    def _pen(self) -> QPen:
+        return self._ACTIVE_PEN if self._region_enabled else self._DISABLED_PEN
+
+    def _apply_pens(self) -> None:
+        for item in self._regions:
+            item.setPen(self._pen())
+        if self._draft_item is not None:
+            self._draft_item.setPen(self._pen())
+
+    def _new_polygon_item(self, kind: str) -> QGraphicsPolygonItem:
+        item = QGraphicsPolygonItem()
+        item.setBrush(QBrush(Qt.BrushStyle.NoBrush))  # outline only
+        item.setPen(self._pen())
+        item.setZValue(1)
+        item.setData(_KIND_KEY, kind)
+        self._scene.addItem(item)
+        return item
+
+    def _update_cursor(self) -> None:
+        cursors = {
+            TOOL_POINTER: Qt.CursorShape.ArrowCursor,
+            TOOL_RECTANGLE: Qt.CursorShape.CrossCursor,
+            TOOL_POLYGON: Qt.CursorShape.CrossCursor,
+            TOOL_DELETE: Qt.CursorShape.PointingHandCursor,
+        }
+        self.setCursor(cursors.get(self._tool, Qt.CursorShape.ArrowCursor))
+
+    def _cancel_draft(self) -> None:
+        if self._draft_item is not None:
+            self._scene.removeItem(self._draft_item)
+            self._draft_item = None
+        self._rect_first = None
         self._poly_points = []
-        if was_building and self._region_item is not None and self._region_kind is None:
-            # Nothing was ever committed into this item — remove it.
-            self._scene.removeItem(self._region_item)
-            self._region_item = None
+        self._drag_item = None
+        self._drag_vertex = -1
 
-    def _commit(self, kind: str) -> None:
-        self._region_kind = kind
-        self.set_region_enabled(True)
-        self.regionChanged.emit(True)
+    def _reset_to_pointer(self) -> None:
+        self._cancel_draft()
+        self._tool = TOOL_POINTER
+        self._update_cursor()
+        self._refresh_handles()
+        self.toolReset.emit()
 
-    # ---- mouse: rectangle -------------------------------------------------
+    def _commit_region(self) -> None:
+        self._regions.append(self._draft_item)
+        self._draft_item = None
+        self.regionsChanged.emit()
+        self._reset_to_pointer()
+
+    def _clear_all_regions(self) -> None:
+        for item in self._regions:
+            self._scene.removeItem(item)
+        self._regions = []
+        self._cancel_draft()
+        self._refresh_handles()
+        self.regionsChanged.emit()
+
+    # ---- vertex handles (pointer tool) ------------------------------------
+
+    def _refresh_handles(self) -> None:
+        for handle in self._handles:
+            self._scene.removeItem(handle)
+        self._handles = []
+        if self._tool != TOOL_POINTER:
+            return
+        for item in self._regions:
+            poly = item.polygon()
+            for i in range(poly.count()):
+                handle = QGraphicsRectItem(-4, -4, 8, 8)
+                handle.setFlag(
+                    QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations
+                )
+                handle.setPen(QPen(QColor(30, 30, 30)))
+                handle.setBrush(QBrush(QColor(255, 196, 0)))
+                handle.setZValue(2)
+                handle.setPos(poly.at(i))
+                self._scene.addItem(handle)
+                self._handles.append(handle)
+
+    # ---- hit testing ------------------------------------------------------
+
+    def _find_vertex(self, point: QPointF):
+        threshold = self._scene_threshold(10.0)
+        best = None
+        best_dist = threshold
+        for item in self._regions:
+            poly = item.polygon()
+            for i in range(poly.count()):
+                dist = (poly.at(i) - point).manhattanLength()
+                if dist <= best_dist:
+                    best_dist = dist
+                    best = (item, i)
+        return best
+
+    def _find_region(self, point: QPointF) -> QGraphicsPolygonItem | None:
+        threshold = self._scene_threshold(8.0)
+        for item in reversed(self._regions):  # topmost first
+            poly = item.polygon()
+            if poly.containsPoint(point, Qt.FillRule.OddEvenFill):
+                return item
+            for i in range(poly.count()):
+                if (poly.at(i) - point).manhattanLength() <= threshold:
+                    return item
+        return None
+
+    @staticmethod
+    def _set_vertex(item: QGraphicsPolygonItem, index: int, point: QPointF) -> None:
+        pts = list(item.polygon())
+        pts[index] = point
+        item.setPolygon(QPolygonF(pts))
+
+    # ---- mouse dispatch ---------------------------------------------------
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
-        if self._edit_mode:
-            point = self._clamp_to_video(self.mapToScene(event.pos()))
-            if self._mode == MODE_RECTANGLE:
-                self._rect_press(event, point)
-                return
-            if self._mode == MODE_POLYGON:
-                self._poly_press(event, point)
-                return
+        if not self._video_size.isEmpty():
+            point = self._clamp(self.mapToScene(event.pos()))
+            if self._tool == TOOL_RECTANGLE:
+                return self._rect_press(event, point)
+            if self._tool == TOOL_POLYGON:
+                return self._poly_press(event, point)
+            if self._tool == TOOL_DELETE:
+                return self._delete_press(event, point)
+            if self._tool == TOOL_POINTER:
+                return self._pointer_press(event, point)
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        if self._edit_mode:
-            point = self._clamp_to_video(self.mapToScene(event.pos()))
-            if self._mode == MODE_RECTANGLE and self._rect_origin is not None:
-                self._rect_to(point)
-                event.accept()
-                return
-            if self._mode == MODE_POLYGON and self._poly_points:
+        if not self._video_size.isEmpty():
+            point = self._clamp(self.mapToScene(event.pos()))
+            if self._tool == TOOL_RECTANGLE and self._rect_first is not None:
+                self._rect_preview(point)
+                return event.accept()
+            if self._tool == TOOL_POLYGON and self._poly_points:
                 self._poly_preview(point)
-                event.accept()
-                return
+                return event.accept()
+            if self._tool == TOOL_POINTER:
+                self._pointer_move(point)
+                return event.accept()
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        if self._edit_mode and self._mode == MODE_RECTANGLE and self._rect_origin:
-            self._rect_finish()
-            event.accept()
-            return
+        if self._tool == TOOL_POINTER and self._drag_item is not None:
+            self._drag_item = None
+            self._drag_vertex = -1
+            self.regionsChanged.emit()
+            return event.accept()
         super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
-        if self._edit_mode and self._mode == MODE_POLYGON:
+        if self._tool == TOOL_POLYGON:
             self._poly_close()
-            event.accept()
-            return
+            return event.accept()
         super().mouseDoubleClickEvent(event)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
-        if self._edit_mode and self._mode == MODE_POLYGON and self._poly_points:
-            if event.key() == Qt.Key.Key_Escape:
-                self._cancel_in_progress()
-                self.regionChanged.emit(self.has_region())
-                return
-            if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+        if event.key() == Qt.Key.Key_Escape:
+            self._reset_to_pointer()
+            return
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if self._tool == TOOL_POLYGON:
                 self._poly_close()
                 return
         super().keyPressEvent(event)
 
-    # ---- rectangle construction ------------------------------------------
+    # ---- rectangle tool ---------------------------------------------------
 
     def _rect_press(self, event: QMouseEvent, point: QPointF) -> None:
         if event.button() != Qt.MouseButton.LeftButton:
             return
-        # Starting a fresh rectangle replaces any existing region.
-        self.clear_region()
-        self._rect_origin = point
-        item = self._ensure_item()
-        item.setPolygon(QPolygonF([point]))
+        if self._rect_first is None:
+            self._rect_first = point
+            self._draft_item = self._new_polygon_item(TOOL_RECTANGLE)
+            self._draft_item.setPolygon(QPolygonF([point]))
+        else:
+            self._rect_preview(point)
+            rect = self._draft_item.polygon().boundingRect()
+            if rect.width() < self._MIN_SIZE or rect.height() < self._MIN_SIZE:
+                self._cancel_draft()  # degenerate; discard and stay in the tool
+            else:
+                self._commit_region()
         event.accept()
 
-    def _rect_to(self, point: QPointF) -> None:
-        rect = QRectF(self._rect_origin, point).normalized()
-        corners = [
-            rect.topLeft(),
-            rect.topRight(),
-            rect.bottomRight(),
-            rect.bottomLeft(),
-        ]
-        self._region_item.setPolygon(QPolygonF(corners))
+    def _rect_preview(self, point: QPointF) -> None:
+        rect = QRectF(self._rect_first, point).normalized()
+        self._draft_item.setPolygon(
+            QPolygonF(
+                [rect.topLeft(), rect.topRight(), rect.bottomRight(), rect.bottomLeft()]
+            )
+        )
 
-    def _rect_finish(self) -> None:
-        self._rect_origin = None
-        rect = self._region_item.polygon().boundingRect()
-        if rect.width() < self._MIN_SIZE or rect.height() < self._MIN_SIZE:
-            self.clear_region()  # discard accidental tiny drags
-        else:
-            self._commit(MODE_RECTANGLE)
-
-    # ---- polygon construction --------------------------------------------
+    # ---- polygon tool -----------------------------------------------------
 
     def _poly_press(self, event: QMouseEvent, point: QPointF) -> None:
         if event.button() == Qt.MouseButton.RightButton:
             if self._poly_points:
                 self._poly_points.pop()
-                self._poly_preview(point)
+                if self._poly_points:
+                    self._poly_preview(point)
+                else:
+                    self._cancel_draft()
             return
         if event.button() != Qt.MouseButton.LeftButton:
             return
 
         if not self._poly_points:
-            # Starting a new polygon replaces any existing committed region.
-            self.clear_region()
-            self._ensure_item()
+            self._draft_item = self._new_polygon_item(TOOL_POLYGON)
 
         threshold = self._scene_threshold(12.0)
-        # Click near the first vertex closes the polygon.
         if len(self._poly_points) >= 3:
-            first = self._poly_points[0]
-            if (point - first).manhattanLength() <= threshold:
+            if (point - self._poly_points[0]).manhattanLength() <= threshold:
                 self._poly_close()
                 return
-        # Ignore points coincident with the previous one (e.g. double-click).
         if self._poly_points and (
             point - self._poly_points[-1]
         ).manhattanLength() <= threshold:
-            return
+            return  # ignore points coincident with the previous one
 
         self._poly_points.append(point)
         self._poly_preview(point)
         event.accept()
 
     def _poly_preview(self, cursor: QPointF) -> None:
-        if self._region_item is None:
-            return
-        self._region_item.setPolygon(QPolygonF(self._poly_points + [cursor]))
+        if self._draft_item is not None:
+            self._draft_item.setPolygon(QPolygonF(self._poly_points + [cursor]))
 
     def _poly_close(self) -> None:
         if len(self._poly_points) < 3:
             return
-        self._region_item.setPolygon(QPolygonF(self._poly_points))
+        self._draft_item.setPolygon(QPolygonF(self._poly_points))
         self._poly_points = []
-        self._commit(MODE_POLYGON)
+        self._commit_region()
+
+    # ---- delete tool ------------------------------------------------------
+
+    def _delete_press(self, event: QMouseEvent, point: QPointF) -> None:
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        item = self._find_region(point)
+        if item is not None:
+            self._regions.remove(item)
+            self._scene.removeItem(item)
+            self._refresh_handles()
+            self.regionsChanged.emit()
+        event.accept()
+
+    # ---- pointer tool -----------------------------------------------------
+
+    def _pointer_press(self, event: QMouseEvent, point: QPointF) -> None:
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        found = self._find_vertex(point)
+        if found is None:
+            return
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            self._delete_vertex(*found)  # Ctrl+click removes the vertex
+        else:
+            self._drag_item, self._drag_vertex = found
+        event.accept()
+
+    def _delete_vertex(self, item: QGraphicsPolygonItem, index: int) -> None:
+        pts = list(item.polygon())
+        if len(pts) <= 3:
+            # A polygon needs ≥3 vertices, so removing one leaves no valid
+            # region — drop the whole thing.
+            self._regions.remove(item)
+            self._scene.removeItem(item)
+        else:
+            del pts[index]
+            item.setPolygon(QPolygonF(pts))
+        self._refresh_handles()
+        self.regionsChanged.emit()
+
+    def _pointer_move(self, point: QPointF) -> None:
+        if self._drag_item is not None:
+            self._set_vertex(self._drag_item, self._drag_vertex, point)
+            self._refresh_handles()
+            return
+        # Hover feedback: a move cursor when over a draggable vertex.
+        over_vertex = self._find_vertex(point) is not None
+        self.setCursor(
+            Qt.CursorShape.SizeAllCursor
+            if over_vertex
+            else Qt.CursorShape.ArrowCursor
+        )

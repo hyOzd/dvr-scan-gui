@@ -15,11 +15,13 @@ writes any extracted video clips to disk. The original video drives the player.
   scan range (start / end / duration), and performance (downscale, frame skip).
 - **Integrated player** (Qt Multimedia) with play/pause, volume, and a live
   time readout.
-- **Detection region** — draw a **rectangle or a polygon** directly on the
-  video to limit motion detection to that area (passed to DVR-Scan as `-a`).
-  Shown as a dashed outline; coordinates map exactly to source pixels
-  regardless of how the video is scaled on screen. The region can be
-  **deleted**, or **disabled** (kept on screen but excluded from the scan).
+- **Detection regions** — a small tool bar (Pointer / Rectangle / Polygon /
+  Delete) lets you draw **one or more** regions directly on the video to limit
+  motion detection (each is passed to DVR-Scan as its own `-a`). Regions are
+  dashed outlines with no fill; coordinates map exactly to source pixels
+  regardless of on-screen scaling. Edit corners with the pointer, remove a
+  region with delete, or **disable** the whole set (kept on screen but excluded
+  from the scan) via the **Enabled** checkbox.
 - **Motion overlay seek bar** — every detected event is painted as a band on
   the timeline. Click or drag anywhere to scrub.
 - **Results table** of events (index, start, duration). Single-click highlights
@@ -54,14 +56,18 @@ pipenv run python -m dvr_scan_gui
 
 1. **Browse…** to choose an input video (it loads into the player immediately).
 2. Adjust detection options on the left if needed.
-3. *(Optional)* Pick **Rectangle** or **Polygon**, click **Draw**, then define
-   a region on the video to restrict detection:
-   - *Rectangle*: drag a box.
-   - *Polygon*: click each vertex; double-click (or click the first vertex) to
-     close. Right-click undoes the last vertex; Esc cancels.
+3. *(Optional)* Define one or more detection regions with the region tool bar:
+   - **Pointer** (default): drag the corner handles to adjust an existing
+     region; **Ctrl+click** a handle to delete that vertex (removing the last
+     valid vertex deletes the region).
+   - **Rectangle**: click two opposite corners (the box previews as you move).
+   - **Polygon**: click each vertex (the next edge previews live); double-click,
+     or click the first vertex, to close. Right-click removes the last vertex.
+   - **Delete**: click a region to remove it.
 
-   Uncheck **Apply** to keep the region but exclude it from the scan, or
-   **Delete** to remove it. Loading a new video clears it automatically.
+   Finishing a shape (or pressing **Esc**) returns to the pointer. Uncheck
+   **Enabled** to keep the regions but exclude them from the scan. Loading a new
+   video clears them automatically.
 4. Click **Scan for motion**. Progress shows in the bar below the button.
 5. When the scan finishes, events appear on the seek bar and in the results
    table on the right.

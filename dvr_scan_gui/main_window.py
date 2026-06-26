@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import os
 
-from PySide6.QtCore import QStandardPaths, Qt, QUrl
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtCore import QSize, QStandardPaths, Qt, QUrl
+from PySide6.QtGui import QAction, QKeySequence, QPalette
 from PySide6.QtMultimedia import QAudioOutput, QMediaMetaData, QMediaPlayer
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QButtonGroup,
     QCheckBox,
-    QComboBox,
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
@@ -31,9 +31,16 @@ from PySide6.QtWidgets import (
 )
 
 from .config_panel import ConfigPanel
+from .icons import tool_icon
 from .scanner import MotionEvent, Scanner, ms_to_timecode
 from .timeline import TimelineSeekBar
-from .video_view import MODE_POLYGON, MODE_RECTANGLE, VideoView
+from .video_view import (
+    TOOL_DELETE,
+    TOOL_POINTER,
+    TOOL_POLYGON,
+    TOOL_RECTANGLE,
+    VideoView,
+)
 
 _VIDEO_FILTER = (
     "Video files (*.mp4 *.avi *.mkv *.mov *.m4v *.mpg *.mpeg *.wmv *.flv *.webm);;"
@@ -126,44 +133,47 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(container)
 
         self.video_view = VideoView()
-        self.video_view.regionChanged.connect(self._on_region_changed)
+        self.video_view.toolReset.connect(self._on_tool_reset)
         layout.addWidget(self.video_view, 1)
 
-        # Detection-region controls.
+        # Detection-region tool bar.
         region_row = QHBoxLayout()
         region_row.addWidget(QLabel("Region:"))
 
-        self.region_mode = QComboBox()
-        self.region_mode.addItem("Rectangle", MODE_RECTANGLE)
-        self.region_mode.addItem("Polygon", MODE_POLYGON)
-        self.region_mode.setToolTip("Shape to draw for the detection region.")
-        self.region_mode.currentIndexChanged.connect(self._on_region_mode_changed)
-        region_row.addWidget(self.region_mode)
+        self._tool_group = QButtonGroup(self)
+        self._tool_group.setExclusive(True)
+        self._tool_buttons: dict[str, QPushButton] = {}
+        icon_color = self.palette().color(QPalette.ColorRole.ButtonText)
+        for tool, name, tip in (
+            (TOOL_POINTER, "Pointer",
+             "Pointer — drag region corners to adjust them (Ctrl+click deletes a corner)."),
+            (TOOL_RECTANGLE, "Rectangle",
+             "Rectangle — click two opposite corners to draw a box."),
+            (TOOL_POLYGON, "Polygon",
+             "Polygon — click each vertex; double-click to close."),
+            (TOOL_DELETE, "Delete", "Delete — click a region to remove it."),
+        ):
+            button = QPushButton()
+            button.setIcon(tool_icon(tool, icon_color))
+            button.setIconSize(QSize(20, 20))
+            button.setCheckable(True)
+            button.setToolTip(tip)
+            button.setAccessibleName(name)
+            button.clicked.connect(lambda _=False, t=tool: self._on_tool_clicked(t))
+            self._tool_group.addButton(button)
+            self._tool_buttons[tool] = button
+            region_row.addWidget(button)
+        self._tool_buttons[TOOL_POINTER].setChecked(True)
 
-        self.region_button = QPushButton("Draw")
-        self.region_button.setCheckable(True)
-        self.region_button.setToolTip(
-            "Draw a region on the video to limit motion detection to that area."
-        )
-        self.region_button.toggled.connect(self._on_region_toggled)
-        region_row.addWidget(self.region_button)
-
-        self.region_enabled_check = QCheckBox("Apply")
+        self.region_enabled_check = QCheckBox("Enabled")
         self.region_enabled_check.setChecked(True)
         self.region_enabled_check.setToolTip(
-            "Uncheck to keep the region but exclude it from the next scan."
+            "Uncheck to keep the regions but exclude them from the next scan."
         )
         self.region_enabled_check.toggled.connect(self._on_region_enabled_toggled)
         region_row.addWidget(self.region_enabled_check)
 
-        self.clear_region_button = QPushButton("Delete")
-        self.clear_region_button.setEnabled(False)
-        self.clear_region_button.clicked.connect(self.video_view.clear_region)
-        region_row.addWidget(self.clear_region_button)
-
-        self.region_label = QLabel("No region — scanning the full frame.")
-        self.region_label.setStyleSheet("color: gray;")
-        region_row.addWidget(self.region_label, 1)
+        region_row.addStretch(1)
         layout.addLayout(region_row)
 
         self.timeline = TimelineSeekBar()
@@ -278,8 +288,8 @@ class MainWindow(QMainWindow):
             return
         self._load_input(path)
         options = self.config_panel.options(path)
-        if self.video_view.is_region_enabled():
-            options.region_points = self.video_view.region_points()
+        if self.video_view.is_region_enabled() and self.video_view.has_regions():
+            options.regions = self.video_view.regions_points()
         self.progress.setValue(0)
         self._set_scanning(True)
         self._set_status("Scanning for motion…")
@@ -290,65 +300,25 @@ class MainWindow(QMainWindow):
         self.cancel_button.setEnabled(scanning)
         self.config_panel.set_enabled(not scanning)
         self.input_edit.setEnabled(not scanning)
-        self.region_button.setEnabled(not scanning)
-        self.region_mode.setEnabled(not scanning)
         self.region_enabled_check.setEnabled(not scanning)
-        self.clear_region_button.setEnabled(
-            not scanning and self.video_view.has_region()
-        )
+        for button in self._tool_buttons.values():
+            button.setEnabled(not scanning)
 
     # ---- detection region -------------------------------------------------
 
-    def _on_region_mode_changed(self) -> None:
-        self.video_view.set_mode(self.region_mode.currentData())
-        if self.region_button.isChecked():
-            self._update_region_hint()
-
-    def _on_region_toggled(self, checked: bool) -> None:
-        if checked and not self.video_view.can_edit():
-            self.region_button.setChecked(False)
-            self._set_status("Load a video before defining a region.")
+    def _on_tool_clicked(self, tool: str) -> None:
+        if tool in (TOOL_RECTANGLE, TOOL_POLYGON) and not self.video_view.can_edit():
+            self._tool_buttons[TOOL_POINTER].setChecked(True)
+            self._set_status("Load a video before drawing a region.")
             return
-        self.video_view.set_edit_mode(checked)
-        if checked:
-            self._update_region_hint()
-        else:
-            self._refresh_region_label()
+        self.video_view.set_tool(tool)
+
+    def _on_tool_reset(self) -> None:
+        # The view finished a drawing (or Esc) — reflect the pointer tool.
+        self._tool_buttons[TOOL_POINTER].setChecked(True)
 
     def _on_region_enabled_toggled(self, enabled: bool) -> None:
         self.video_view.set_region_enabled(enabled)
-        self._refresh_region_label()
-
-    def _update_region_hint(self) -> None:
-        if self.region_mode.currentData() == MODE_POLYGON:
-            self.region_label.setText(
-                "Click to add points; double-click (or click the first point) to "
-                "close. Right-click undoes, Esc cancels."
-            )
-        else:
-            self.region_label.setText("Drag on the video to draw a rectangle.")
-
-    def _on_region_changed(self, has_region: bool) -> None:
-        self.clear_region_button.setEnabled(has_region)
-        self._refresh_region_label()
-
-    def _refresh_region_label(self) -> None:
-        points = self.video_view.region_points()
-        if not points:
-            self.region_label.setText("No region — scanning the full frame.")
-            return
-        suffix = "" if self.video_view.is_region_enabled() else " — disabled"
-        if self.video_view.region_kind() == MODE_RECTANGLE:
-            xs = [x for x, _ in points]
-            ys = [y for _, y in points]
-            w, h = max(xs) - min(xs), max(ys) - min(ys)
-            self.region_label.setText(
-                f"Region: rectangle {w}×{h}px at ({min(xs)}, {min(ys)}){suffix}."
-            )
-        else:
-            self.region_label.setText(
-                f"Region: polygon, {len(points)} points{suffix}."
-            )
 
     def _on_progress(self, value: int) -> None:
         self.progress.setValue(value)
