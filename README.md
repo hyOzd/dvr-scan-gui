@@ -23,10 +23,12 @@ writes any extracted video clips to disk. The original video drives the player.
 - **Parallel scanning** — choose how many files to scan at once (defaults to
   about half your CPU cores). The main progress bar shows **total** progress
   across the batch with an **ETA**.
-- **Configuration panel** for the common DVR-Scan options: threshold,
-  background subtractor, kernel size, min event length, pre/post-event padding,
-  scan range (start / end / duration), and performance (downscale, frame skip).
-  Show or hide it with the **Configuration** toolbar toggle.
+- **Tabbed left panel** — the file list and the **Configuration** form share a
+  tabbed panel on the left. Starting a scan automatically switches back to the
+  **Files** tab so you can watch progress.
+- **Configuration tab** for the common DVR-Scan options: threshold, background
+  subtractor, kernel size, min event length, pre/post-event padding, scan range
+  (start / end / duration), and performance (downscale, frame skip).
 - **Integrated player** (Qt Multimedia) with play/pause, volume, and a live
   time readout.
 - **Per-file detection regions** — a small tool bar (Pointer / Rectangle /
@@ -71,8 +73,8 @@ pipenv run python -m dvr_scan_gui
 
 1. **Add…** one or more videos, or drag video files onto the file list. Click a
    file to load it into the player.
-2. Adjust detection options in the **Configuration** panel if needed (toggle it
-   from the toolbar to reclaim space).
+2. Adjust detection options on the **Configuration** tab (next to **Files** in
+   the left panel) if needed.
 3. *(Optional)* Define one or more detection regions with the region tool bar.
    Regions are saved per file:
    - **Pointer** (default): drag the corner handles to adjust an existing

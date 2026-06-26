@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QSplitter,
     QStyle,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -123,21 +124,21 @@ class MainWindow(QMainWindow):
     def _build_ui(self) -> None:
         self._build_actions()
 
+        self.left_tabs = QTabWidget()
+        self._files_tab_index = self.left_tabs.addTab(
+            self._build_files_side(), "Files"
+        )
+        self.left_tabs.addTab(self._build_config_side(), "Configuration")
+
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(self._build_files_side())
-        self._config_container = self._build_config_side()
-        splitter.addWidget(self._config_container)
+        splitter.addWidget(self.left_tabs)
         splitter.addWidget(self._build_player_side())
         splitter.addWidget(self._build_results_side())
         splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 0)
-        splitter.setStretchFactor(2, 1)
-        splitter.setStretchFactor(3, 0)
-        splitter.setSizes([250, 280, 560, 250])
+        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(2, 0)
+        splitter.setSizes([300, 560, 250])
         self.setCentralWidget(splitter)
-
-        # Wire the config toggle now that the container exists.
-        self.config_action.toggled.connect(self._config_container.setVisible)
 
     def _build_actions(self) -> None:
         self.add_action = QAction("&Add files…", self)
@@ -148,29 +149,18 @@ class MainWindow(QMainWindow):
         self.remove_action.triggered.connect(self._remove_selected)
         self.remove_action.setEnabled(False)
 
-        self.config_action = QAction("&Configuration", self)
-        self.config_action.setCheckable(True)
-        self.config_action.setChecked(True)
-        self.config_action.setToolTip("Show or hide the detection settings panel.")
-
         toolbar = self.addToolBar("Main")
         toolbar.setMovable(False)
         toolbar.addAction(self.add_action)
         toolbar.addAction(self.remove_action)
-        toolbar.addSeparator()
-        toolbar.addAction(self.config_action)
 
         file_menu = self.menuBar().addMenu("&File")
         file_menu.addAction(self.add_action)
         file_menu.addAction(self.remove_action)
-        view_menu = self.menuBar().addMenu("&View")
-        view_menu.addAction(self.config_action)
 
     def _build_files_side(self) -> QWidget:
         container = QWidget()
         layout = QVBoxLayout(container)
-
-        layout.addWidget(QLabel("<b>Files</b>"))
 
         button_row = QHBoxLayout()
         self.add_button = QPushButton("Add…")
@@ -239,7 +229,6 @@ class MainWindow(QMainWindow):
         container = QWidget()
         layout = QVBoxLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(QLabel("<b>Detection settings</b>"))
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -648,6 +637,7 @@ class MainWindow(QMainWindow):
         self._batch_start = time.monotonic()
         self._scanner.set_max_concurrent(self.cores_spin.value())
         self._set_scanning(True)
+        self.left_tabs.setCurrentIndex(self._files_tab_index)
 
         for path in paths:
             entry = self._entries[path]
