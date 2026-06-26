@@ -147,6 +147,26 @@ class VideoView(QGraphicsView):
                 result.append(pts)
         return result
 
+    def set_regions(self, regions: list[list[tuple[int, int]]]) -> None:
+        """Replace the displayed regions with ``regions`` (per-file restore).
+
+        This is a *programmatic* change — it does not emit ``regionsChanged``.
+        Points are clamped to the current video size; if the size is not yet
+        known, the view is simply cleared (the caller re-applies once it is).
+        """
+        self._clear_regions_silent()
+        if not self.can_edit():
+            return
+        for pts in regions:
+            if len(pts) < 3:
+                continue
+            item = self._new_polygon_item(TOOL_POLYGON)
+            item.setPolygon(
+                QPolygonF([self._clamp(QPointF(float(x), float(y))) for x, y in pts])
+            )
+            self._regions.append(item)
+        self._refresh_handles()
+
     # ---- video sizing -----------------------------------------------------
 
     def _on_native_size_changed(self, size) -> None:
@@ -168,7 +188,9 @@ class VideoView(QGraphicsView):
         self.video_item.setSize(size)
         self._scene.setSceneRect(self._video_size)
         # Regions from a previous (differently-sized) video are no longer valid.
-        self._clear_all_regions()
+        # This is a programmatic reset (the owner restores the new file's
+        # regions afterwards), so it must not emit regionsChanged.
+        self._clear_regions_silent()
         self._fit()
 
     def resizeEvent(self, event) -> None:
@@ -239,12 +261,17 @@ class VideoView(QGraphicsView):
         self.regionsChanged.emit()
         self._reset_to_pointer()
 
-    def _clear_all_regions(self) -> None:
+    def _clear_regions_silent(self) -> None:
+        """Remove every region without emitting regionsChanged (programmatic)."""
         for item in self._regions:
             self._scene.removeItem(item)
         self._regions = []
         self._cancel_draft()
         self._refresh_handles()
+
+    def clear_regions(self) -> None:
+        """Remove every region as a user action (emits regionsChanged)."""
+        self._clear_regions_silent()
         self.regionsChanged.emit()
 
     # ---- vertex handles (pointer tool) ------------------------------------

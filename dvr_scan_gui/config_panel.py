@@ -21,8 +21,9 @@ from .scanner import ScanOptions
 class ConfigPanel(QWidget):
     """Exposes the common DVR-Scan detection parameters as a form."""
 
-    # Emitted when the input video changes, so the player can load it.
-    inputChanged = Signal(str)
+    # Emitted whenever any detection option changes, so already-scanned files
+    # can be flagged as needing a re-scan with the new settings.
+    changed = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -117,6 +118,20 @@ class ConfigPanel(QWidget):
 
         layout.addWidget(perf)
         layout.addStretch(1)
+
+        # Re-emit a single `changed` signal whenever any option is edited.
+        for spin in (self.threshold, self.kernel_size, self.downscale, self.frame_skip):
+            spin.valueChanged.connect(self.changed)
+        self.bg_subtractor.currentIndexChanged.connect(self.changed)
+        for edit in (
+            self.min_event_length,
+            self.time_before,
+            self.time_post,
+            self.start_time,
+            self.end_time,
+            self.duration,
+        ):
+            edit.textChanged.connect(self.changed)
 
     def options(self, input_path: str) -> ScanOptions:
         """Build a :class:`ScanOptions` from the current form values."""

@@ -129,41 +129,41 @@ class ScanOptions:
         return args
 
 
-class Scanner(QObject):
-    """Runs ``dvr-scan`` asynchronously via :class:`QProcess`.
+def find_executable() -> str | None:
+    """Locate the dvr-scan executable, or None if it is not installed."""
+    return shutil.which("dvr-scan")
 
-    Signals:
-        progress(int):           0-100 percentage parsed from stderr.
-        log(str):                raw stderr lines, for the log view.
-        finished(list):          list[MotionEvent] on success.
-        failed(str):             human-readable error message.
+
+class ScanWorker(QObject):
+    """Runs ``dvr-scan`` for a *single* file asynchronously via :class:`QProcess`.
+
+    One worker owns one process and is used once. Signals:
+        progress(int):    0-100 percentage parsed from stderr.
+        log(str):         informative dvr-scan lines.
+        finished(list):   list[MotionEvent] on success.
+        failed(str):      human-readable error message.
+        cancelled():      the worker was cancelled by the caller.
     """
 
     progress = Signal(int)
     log = Signal(str)
     finished = Signal(list)
     failed = Signal(str)
+    cancelled = Signal()
 
-    def __init__(self, parent: QObject | None = None) -> None:
+    def __init__(self, options: ScanOptions, parent: QObject | None = None) -> None:
         super().__init__(parent)
+        self._options = options
         self._process: QProcess | None = None
         self._stdout = ""
-
-    @staticmethod
-    def executable() -> str | None:
-        """Locate the dvr-scan executable, or None if not installed."""
-        return shutil.which("dvr-scan")
+        self._cancelled = False
 
     @property
     def is_running(self) -> bool:
         return self._process is not None
 
-    def start(self, options: ScanOptions) -> None:
-        if self.is_running:
-            self.failed.emit("A scan is already in progress.")
-            return
-
-        exe = self.executable()
+    def start(self) -> None:
+        exe = find_executable()
         if not exe:
             self.failed.emit(
                 "Could not find the 'dvr-scan' executable on PATH. "
@@ -174,7 +174,7 @@ class Scanner(QObject):
         self._stdout = ""
         self._process = QProcess(self)
         self._process.setProgram(exe)
-        self._process.setArguments(options.to_args())
+        self._process.setArguments(self._options.to_args())
         self._process.readyReadStandardOutput.connect(self._on_stdout)
         self._process.readyReadStandardError.connect(self._on_stderr)
         self._process.finished.connect(self._on_finished)
@@ -182,6 +182,7 @@ class Scanner(QObject):
         self._process.start()
 
     def cancel(self) -> None:
+        self._cancelled = True
         if self._process is not None:
             self._process.kill()
 
@@ -210,14 +211,19 @@ class Scanner(QObject):
                 self.log.emit(chunk)
 
     def _on_error(self, _error: QProcess.ProcessError) -> None:
+        if self._cancelled:
+            return
         if self._process is not None:
             self.failed.emit(f"Failed to run dvr-scan: {self._process.errorString()}")
 
     def _on_finished(self, exit_code: int, status: QProcess.ExitStatus) -> None:
         process = self._process
         self._process = None
+        if self._cancelled:
+            self.cancelled.emit()
+            return
         if status == QProcess.ExitStatus.CrashExit:
-            self.failed.emit("The scan was cancelled or the process crashed.")
+            self.failed.emit("The scan process crashed.")
             return
         if exit_code != 0:
             tail = (process.errorString() if process else "") or "unknown error"
@@ -237,3 +243,124 @@ class Scanner(QObject):
         events = parse_events(csv_line)
         self.progress.emit(100)
         self.finished.emit(events)
+
+
+class ScanManager(QObject):
+    """Queues per-file scans and runs up to ``max_concurrent`` at a time.
+
+    Files are started in the order they are enqueued, but several may run
+    concurrently to use multiple CPU cores. Every signal is keyed by the file
+    path so the UI can route updates to the right row.
+
+    Signals:
+        started(str):          a file's scan began.
+        progress(str, int):    0-100 progress for a file.
+        log(str, str):         an informative line for a file.
+        finished(str, list):   a file finished with list[MotionEvent].
+        failed(str, str):      a file failed with an error message.
+        cancelled(str):        a file's scan was cancelled.
+        queueChanged():        the queue/running set changed.
+        idle():                nothing is running or queued any more.
+    """
+
+    started = Signal(str)
+    progress = Signal(str, int)
+    log = Signal(str, str)
+    finished = Signal(str, list)
+    failed = Signal(str, str)
+    cancelled = Signal(str)
+    queueChanged = Signal()
+    idle = Signal()
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._max_concurrent = 1
+        self._queue: list[tuple[str, ScanOptions]] = []
+        self._workers: dict[str, ScanWorker] = {}
+
+    @staticmethod
+    def executable() -> str | None:
+        return find_executable()
+
+    def set_max_concurrent(self, n: int) -> None:
+        self._max_concurrent = max(1, int(n))
+        self._pump()
+
+    def max_concurrent(self) -> int:
+        return self._max_concurrent
+
+    def is_active(self) -> bool:
+        return bool(self._workers or self._queue)
+
+    def is_running(self, key: str) -> bool:
+        return key in self._workers
+
+    def is_queued(self, key: str) -> bool:
+        return any(k == key for k, _ in self._queue)
+
+    def running_keys(self) -> list[str]:
+        return list(self._workers)
+
+    def queued_keys(self) -> list[str]:
+        return [k for k, _ in self._queue]
+
+    def enqueue(self, key: str, options: ScanOptions) -> None:
+        """Queue (or re-queue) a file for scanning, preserving order."""
+        if key in self._workers:
+            return  # already running; ignore
+        self._queue = [(k, o) for k, o in self._queue if k != key]
+        self._queue.append((key, options))
+        self.queueChanged.emit()
+        self._pump()
+
+    def cancel_all(self) -> None:
+        """Drop all queued scans and kill every running one."""
+        cancelled = self.queued_keys()
+        self._queue.clear()
+        for key in cancelled:
+            self.cancelled.emit(key)
+        for worker in list(self._workers.values()):
+            worker.cancel()  # each emits cancelled() -> _on_cancelled
+        self.queueChanged.emit()
+        if not self._workers and not self._queue:
+            self.idle.emit()
+
+    def _pump(self) -> None:
+        while self._queue and len(self._workers) < self._max_concurrent:
+            key, options = self._queue.pop(0)
+            worker = ScanWorker(options, self)
+            self._workers[key] = worker
+            worker.progress.connect(lambda v, k=key: self.progress.emit(k, v))
+            worker.log.connect(lambda m, k=key: self.log.emit(k, m))
+            worker.finished.connect(lambda ev, k=key: self._on_finished(k, ev))
+            worker.failed.connect(lambda msg, k=key: self._on_failed(k, msg))
+            worker.cancelled.connect(lambda k=key: self._on_cancelled(k))
+            self.started.emit(key)
+            self.queueChanged.emit()
+            worker.start()
+
+    def _retire(self, key: str) -> None:
+        worker = self._workers.pop(key, None)
+        if worker is not None:
+            worker.deleteLater()
+
+    def _on_finished(self, key: str, events: list) -> None:
+        self._retire(key)
+        self.finished.emit(key, events)
+        self._after_worker_done()
+
+    def _on_failed(self, key: str, message: str) -> None:
+        self._retire(key)
+        self.failed.emit(key, message)
+        self._after_worker_done()
+
+    def _on_cancelled(self, key: str) -> None:
+        self._retire(key)
+        self.cancelled.emit(key)
+        self._after_worker_done()
+
+    def _after_worker_done(self) -> None:
+        self.queueChanged.emit()
+        self._pump()
+        if not self._workers and not self._queue:
+            self.idle.emit()

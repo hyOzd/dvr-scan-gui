@@ -6,6 +6,7 @@ Run with:  pipenv run python -m pytest   (or: python -m unittest)
 import unittest
 
 from dvr_scan_gui.scanner import (
+    ScanManager,
     ScanOptions,
     ms_to_timecode,
     parse_events,
@@ -89,6 +90,37 @@ class ScanOptionsTests(unittest.TestCase):
             "-a",
             ScanOptions(input_path="x.mp4", regions=[[(1, 2), (3, 4)]]).to_args(),
         )
+
+
+class ScanManagerQueueTests(unittest.TestCase):
+    """Queue ordering/dedup logic, with process launching stubbed out."""
+
+    def _manager(self) -> ScanManager:
+        manager = ScanManager()
+        manager._pump = lambda: None  # don't actually launch dvr-scan
+        return manager
+
+    def test_enqueue_preserves_order(self):
+        m = self._manager()
+        m.enqueue("a.mp4", ScanOptions(input_path="a.mp4"))
+        m.enqueue("b.mp4", ScanOptions(input_path="b.mp4"))
+        m.enqueue("c.mp4", ScanOptions(input_path="c.mp4"))
+        self.assertEqual(m.queued_keys(), ["a.mp4", "b.mp4", "c.mp4"])
+        self.assertTrue(m.is_active())
+
+    def test_requeue_moves_to_end_without_duplicating(self):
+        m = self._manager()
+        m.enqueue("a.mp4", ScanOptions(input_path="a.mp4"))
+        m.enqueue("b.mp4", ScanOptions(input_path="b.mp4"))
+        m.enqueue("a.mp4", ScanOptions(input_path="a.mp4"))
+        self.assertEqual(m.queued_keys(), ["b.mp4", "a.mp4"])
+
+    def test_cancel_all_clears_queue(self):
+        m = self._manager()
+        m.enqueue("a.mp4", ScanOptions(input_path="a.mp4"))
+        m.cancel_all()
+        self.assertEqual(m.queued_keys(), [])
+        self.assertFalse(m.is_active())
 
 
 if __name__ == "__main__":

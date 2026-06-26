@@ -10,23 +10,38 @@ writes any extracted video clips to disk. The original video drives the player.
 
 ## Features
 
+- **Multi-file queue** — add many videos (via **Add…**, the file menu, or by
+  **dragging them onto the list**; duplicates are rejected with a warning). The
+  list shows each file's scan status (*Not scanned / Queued / Scanning / Done /
+  Needs update / Failed*), a slim progress bar, and its detection count. Select
+  any file to load it in the player and review its events — even while other
+  files are still scanning.
+- **Scan one or scan all** — **Scan selected** scans the current file; **Scan
+  all** scans every file in order, skipping any already scanned with the current
+  settings. A file is flagged **Needs update** whenever the settings or its
+  region change after it was scanned.
+- **Parallel scanning** — choose how many files to scan at once (defaults to
+  about half your CPU cores). The main progress bar shows **total** progress
+  across the batch with an **ETA**.
 - **Configuration panel** for the common DVR-Scan options: threshold,
   background subtractor, kernel size, min event length, pre/post-event padding,
   scan range (start / end / duration), and performance (downscale, frame skip).
+  Show or hide it with the **Configuration** toolbar toggle.
 - **Integrated player** (Qt Multimedia) with play/pause, volume, and a live
   time readout.
-- **Detection regions** — a small tool bar (Pointer / Rectangle / Polygon /
-  Delete) lets you draw **one or more** regions directly on the video to limit
-  motion detection (each is passed to DVR-Scan as its own `-a`). Regions are
-  dashed outlines with no fill; coordinates map exactly to source pixels
-  regardless of on-screen scaling. Edit corners with the pointer, remove a
-  region with delete, or **disable** the whole set (kept on screen but excluded
-  from the scan) via the **Enabled** checkbox.
+- **Per-file detection regions** — a small tool bar (Pointer / Rectangle /
+  Polygon / Delete) lets you draw **one or more** regions directly on the video
+  to limit motion detection (each is passed to DVR-Scan as its own `-a`).
+  Regions are remembered per file. They are dashed outlines with no fill;
+  coordinates map exactly to source pixels regardless of on-screen scaling. Edit
+  corners with the pointer, remove a region with delete, or **disable** the set
+  (kept on screen but excluded from the scan) via the **Enabled** checkbox.
 - **Motion overlay seek bar** — every detected event is painted as a band on
   the timeline. Click or drag anywhere to scrub.
 - **Results table** of events (index, start, duration). Single-click highlights
   the event on the timeline; double-click jumps there and plays.
-- Scans run asynchronously with a live progress bar; the UI stays responsive.
+- Scans run asynchronously; the UI stays responsive and a running batch can be
+  **cancelled** at any time (already-completed results are kept).
 
 ## Requirements
 
@@ -54,9 +69,12 @@ pipenv run python -m dvr_scan_gui
 
 ## Usage
 
-1. **Browse…** to choose an input video (it loads into the player immediately).
-2. Adjust detection options on the left if needed.
-3. *(Optional)* Define one or more detection regions with the region tool bar:
+1. **Add…** one or more videos, or drag video files onto the file list. Click a
+   file to load it into the player.
+2. Adjust detection options in the **Configuration** panel if needed (toggle it
+   from the toolbar to reclaim space).
+3. *(Optional)* Define one or more detection regions with the region tool bar.
+   Regions are saved per file:
    - **Pointer** (default): drag the corner handles to adjust an existing
      region; **Ctrl+click** a handle to delete that vertex (removing the last
      valid vertex deletes the region).
@@ -66,21 +84,27 @@ pipenv run python -m dvr_scan_gui
    - **Delete**: click a region to remove it.
 
    Finishing a shape (or pressing **Esc**) returns to the pointer. Uncheck
-   **Enabled** to keep the regions but exclude them from the scan. Loading a new
-   video clears them automatically.
-4. Click **Scan for motion**. Progress shows in the bar below the button.
-5. When the scan finishes, events appear on the seek bar and in the results
-   table on the right.
+   **Enabled** to keep a file's regions but exclude them from the scan.
+4. Set **Parallel scans** to how many files to process at once, then click
+   **Scan selected** (current file) or **Scan all** (every file, skipping ones
+   already up to date). The total progress bar and ETA track the batch; each
+   file's row shows its own status and progress.
+5. As each file finishes, its events appear on the seek bar and results table.
+   You can select and play any finished file while others are still scanning.
 6. **Double-click** any event to jump to it and start playback, or click once
    to highlight it on the timeline.
+7. Click **Cancel** to stop a running batch; files already finished keep their
+   results. Changing a setting or a file's region marks scanned files as
+   **Needs update** so **Scan all** will refresh them.
 
 ## Project layout
 
 | File | Purpose |
 |------|---------|
-| `dvr_scan_gui/scanner.py` | Runs `dvr-scan` via `QProcess`, parses its timecode output, reports progress. |
-| `dvr_scan_gui/video_view.py` | Graphics-view video display with the rectangular detection-region editor. |
+| `dvr_scan_gui/scanner.py` | Runs `dvr-scan` via `QProcess` (one `ScanWorker` per file), a `ScanManager` that queues files and runs several at once, and the timecode parser. |
+| `dvr_scan_gui/file_list.py` | The multi-file model (`FileEntry`), the per-file row widget, and the drag-and-drop file list. |
+| `dvr_scan_gui/video_view.py` | Graphics-view video display with the multi-region detection-region editor. |
 | `dvr_scan_gui/timeline.py` | Custom seek-bar widget that overlays motion events. |
 | `dvr_scan_gui/config_panel.py` | The DVR-Scan options form. |
-| `dvr_scan_gui/main_window.py` | Main window: player, controls, results table, wiring. |
+| `dvr_scan_gui/main_window.py` | Main window: file list, player, controls, results table, scan orchestration, wiring. |
 | `dvr_scan_gui/__main__.py` | Application entry point. |
