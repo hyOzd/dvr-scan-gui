@@ -13,8 +13,8 @@ the track outside the selected range is dimmed.
 
 from __future__ import annotations
 
-from PySide6.QtCore import QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPaintEvent
+from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPaintEvent, QPen, QPolygonF
 from PySide6.QtWidgets import QLineEdit, QSizePolicy, QWidget
 
 from .scanner import MotionEvent, ms_to_timecode
@@ -209,16 +209,31 @@ class TimelineSeekBar(QWidget):
             painter.drawRect(QRectF(end_x, track.top(),
                                     track.right() - end_x, track.height()))
 
-        self._paint_handle(painter, start_x, self._START_COLOR)
-        self._paint_handle(painter, end_x, self._END_COLOR)
+        self._paint_handle(painter, start_x, self._START_COLOR, opening=True)
+        self._paint_handle(painter, end_x, self._END_COLOR, opening=False)
 
-    def _paint_handle(self, painter: QPainter, x: float, color: QColor) -> None:
+    def _paint_handle(
+        self, painter: QPainter, x: float, color: QColor, opening: bool
+    ) -> None:
+        """Draw the handle as a bracket: '[' for start, ']' for end (the arms
+        point inward, toward the selected range)."""
         track = self._track_rect()
         top = track.top() - 5
         bottom = track.bottom() + 5
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(color)
-        painter.drawRoundedRect(QRectF(x - 3.0, top, 6.0, bottom - top), 3.0, 3.0)
+        arm = 6.0 if opening else -6.0
+
+        pen = QPen(color)
+        pen.setWidthF(3.0)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPolyline(QPolygonF([
+            QPointF(x + arm, top),
+            QPointF(x, top),
+            QPointF(x, bottom),
+            QPointF(x + arm, bottom),
+        ]))
 
     # ---- editable labels --------------------------------------------------
 
