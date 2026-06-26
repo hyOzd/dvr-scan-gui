@@ -228,11 +228,18 @@ class MainWindow(QMainWindow):
     def _build_config_side(self) -> QWidget:
         container = QWidget()
         layout = QVBoxLayout(container)
-        layout.setContentsMargins(0, 0, 0, 0)
+        # Keep the style's default layout margins (theme/platform dependent)
+        # rather than zeroing them out — that was what made this look cramped.
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        # The scroll area's viewport is otherwise filled with the Base brush
+        # (darker than Window on dark themes), which shows as an odd darker
+        # rectangle inside the panel. Don't paint a background at all so the
+        # surrounding panel's Window colour shows through, on any style/theme.
+        scroll.setStyleSheet("QScrollArea, QScrollArea > QWidget > QWidget"
+                             " { background: transparent; }")
         self.config_panel = ConfigPanel()
         self.config_panel.changed.connect(self._refresh_all_rows)
         scroll.setWidget(self.config_panel)
