@@ -289,6 +289,7 @@ class MainWindow(QMainWindow):
 
         self.timeline = TimelineSeekBar()
         self.timeline.seekRequested.connect(self._on_user_seek)
+        self.timeline.rangeChanged.connect(self._on_range_changed)
         layout.addWidget(self.timeline)
 
         controls = QHBoxLayout()
@@ -481,6 +482,7 @@ class MainWindow(QMainWindow):
             self._post_play_pause = False
             self.player.setSource(QUrl())
             self.video_view.set_regions([])
+            self.timeline.set_range(None, None)
             self._show_events([])
             self.remove_button.setEnabled(False)
             self.remove_action.setEnabled(False)
@@ -567,12 +569,36 @@ class MainWindow(QMainWindow):
                 entry.region_enabled = enabled
                 self._refresh_row(self._current_path)
 
+    # ---- scan range -------------------------------------------------------
+
+    def _apply_range_for_current(self) -> None:
+        entry = self._entries.get(self._current_path)
+        if entry is None:
+            return
+        self.timeline.set_range(entry.range_start_ms, entry.range_end_ms)
+
+    def _on_range_changed(self, start_ms: int, end_ms: int) -> None:
+        if self._current_path is None:
+            return
+        entry = self._entries.get(self._current_path)
+        if entry is None:
+            return
+        duration = self.timeline.duration_ms()
+        # A bound sitting at the very start/end means "unbounded" on that side.
+        entry.range_start_ms = start_ms if start_ms > 0 else None
+        entry.range_end_ms = end_ms if duration and end_ms < duration else None
+        self._refresh_row(self._current_path)
+
     # ---- scan options / staleness -----------------------------------------
 
     def _options_for(self, entry: FileEntry):
         options = self.config_panel.options(entry.path)
         if entry.region_enabled and entry.regions:
             options.regions = entry.regions
+        if entry.range_start_ms:
+            options.start_time = ms_to_timecode(entry.range_start_ms)
+        if entry.range_end_ms:
+            options.end_time = ms_to_timecode(entry.range_end_ms)
         return options
 
     def _signature_for(self, entry: FileEntry) -> tuple:
@@ -943,6 +969,8 @@ class MainWindow(QMainWindow):
     def _on_duration_changed(self, duration_ms: int) -> None:
         self.timeline.set_duration(duration_ms)
         self._update_time_label(self.player.position(), duration_ms)
+        # Restore this file's saved scan range now that the clip length is known.
+        self._apply_range_for_current()
         if duration_ms > 0:
             self._apply_pending_playback()
 

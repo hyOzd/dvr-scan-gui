@@ -52,6 +52,10 @@ class FileEntry:
     # whether they apply to the scan.
     regions: list = field(default_factory=list)
     region_enabled: bool = True
+    # Per-file scan range in milliseconds; None means unbounded on that side
+    # (from the start of the file / to the end of the file).
+    range_start_ms: int | None = None
+    range_end_ms: int | None = None
 
     @property
     def name(self) -> str:

@@ -27,8 +27,8 @@ writes any extracted video clips to disk. The original video drives the player.
   tabbed panel on the left. Starting a scan automatically switches back to the
   **Files** tab so you can watch progress.
 - **Configuration tab** for the common DVR-Scan options: threshold, background
-  subtractor, kernel size, min event length, pre/post-event padding, scan range
-  (start / end / duration), and performance (downscale, frame skip).
+  subtractor, kernel size, min event length, pre/post-event padding, and
+  performance (downscale, frame skip).
 - **Integrated player** (Qt Multimedia) with play/pause, volume, and a live
   time readout.
 - **Per-file detection regions** — a small tool bar (Pointer / Rectangle /
@@ -40,6 +40,12 @@ writes any extracted video clips to disk. The original video drives the player.
   (kept on screen but excluded from the scan) via the **Enabled** checkbox.
 - **Motion overlay seek bar** — every detected event is painted as a band on
   the timeline. Click or drag anywhere to scrub.
+- **Per-file scan range** — two handles on the seek bar set where the scan
+  starts and ends; the excluded portion is dimmed. Click a handle to reveal an
+  editable label above it and type an exact time (`SS`, `MM:SS`, or
+  `HH:MM:SS`), or just drag it. The range is remembered per file (passed to
+  DVR-Scan as `-st` / `-et`) and dragging a handle to the very start/end clears
+  that bound.
 - **Results table** of events (index, start, duration). Single-click highlights
   the event on the timeline; double-click jumps there and plays.
 - Scans run asynchronously; the UI stays responsive and a running batch can be
@@ -87,19 +93,22 @@ pipenv run python -m dvr_scan_gui
 
    Finishing a shape (or pressing **Esc**) returns to the pointer. Uncheck
    **Enabled** to keep a file's regions but exclude them from the scan.
-4. Set **Parallel scans** to how many files to process at once, then click
+4. *(Optional)* Limit the **scan range** for the selected file by dragging the
+   start/end handles on the seek bar, or click a handle and type an exact time
+   into the label that appears. The range is saved per file.
+5. Set **Parallel scans** to how many files to process at once, then click
    **Scan selected** (current file) or **Scan all** (every file, skipping ones
    already up to date). The total progress bar and ETA track the batch; each
    file's row shows its own status and progress.
-5. As each file finishes, its events appear on the seek bar and results table.
+6. As each file finishes, its events appear on the seek bar and results table.
    You can select and play any finished file while others are still scanning.
-6. **Double-click** any event to jump to it and start playback, or click once
+7. **Double-click** any event to jump to it and start playback, or click once
    to highlight it on the timeline. The **⏮ / ⏭** buttons beside Play step to
    the previous / next detected event; stepping past the last event jumps to the
    next file (and stepping before the first event jumps to the previous file).
-7. Click **Cancel** to stop a running batch; files already finished keep their
-   results. Changing a setting or a file's region marks scanned files as
-   **Needs update** so **Scan all** will refresh them.
+8. Click **Cancel** to stop a running batch; files already finished keep their
+   results. Changing a setting, a file's region, or its scan range marks
+   scanned files as **Needs update** so **Scan all** will refresh them.
 
 ## Project layout
 

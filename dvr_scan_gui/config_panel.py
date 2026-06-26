@@ -10,7 +10,6 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFormLayout,
     QGroupBox,
-    QLabel,
     QLineEdit,
     QSpinBox,
     QVBoxLayout,
@@ -79,29 +78,6 @@ class ConfigPanel(QWidget):
 
         layout.addWidget(timing)
 
-        # --- Range (optional) ------------------------------------------
-        range_box = QGroupBox("Scan range (optional)")
-        range_form = QFormLayout(range_box)
-
-        hint = QLabel("Frames (123), seconds (12.3s), or timecode (00:01:02).")
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color: gray; font-size: 11px;")
-        range_form.addRow(hint)
-
-        self.start_time = QLineEdit()
-        self.start_time.setPlaceholderText("from start")
-        range_form.addRow("Start", self.start_time)
-
-        self.end_time = QLineEdit()
-        self.end_time.setPlaceholderText("to end")
-        range_form.addRow("End", self.end_time)
-
-        self.duration = QLineEdit()
-        self.duration.setPlaceholderText("overrides End")
-        range_form.addRow("Duration", self.duration)
-
-        layout.addWidget(range_box)
-
         # --- Performance -----------------------------------------------
         perf = QGroupBox("Performance")
         perf_form = QFormLayout(perf)
@@ -142,14 +118,7 @@ class ConfigPanel(QWidget):
         for spin in (self.threshold, self.kernel_size, self.downscale, self.frame_skip):
             spin.valueChanged.connect(self.changed)
         self.bg_subtractor.currentIndexChanged.connect(self.changed)
-        for edit in (
-            self.min_event_length,
-            self.time_before,
-            self.time_post,
-            self.start_time,
-            self.end_time,
-            self.duration,
-        ):
+        for edit in (self.min_event_length, self.time_before, self.time_post):
             edit.textChanged.connect(self.changed)
 
     def options(self, input_path: str) -> ScanOptions:
@@ -164,9 +133,6 @@ class ConfigPanel(QWidget):
             kernel_size=self.kernel_size.value(),
             downscale_factor=self.downscale.value(),
             frame_skip=self.frame_skip.value(),
-            start_time=self.start_time.text(),
-            end_time=self.end_time.text(),
-            duration=self.duration.text(),
         )
 
     def set_enabled(self, enabled: bool) -> None:
