@@ -1,0 +1,13 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+PySide6 = "*"
+
+[requires]
+python_version = "3.12"
+
+[scripts]
+gui = "python -m dvr_scan_gui"
