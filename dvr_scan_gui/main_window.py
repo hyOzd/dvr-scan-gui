@@ -149,11 +149,6 @@ class MainWindow(QMainWindow):
         self.remove_action.triggered.connect(self._remove_selected)
         self.remove_action.setEnabled(False)
 
-        toolbar = self.addToolBar("Main")
-        toolbar.setMovable(False)
-        toolbar.addAction(self.add_action)
-        toolbar.addAction(self.remove_action)
-
         file_menu = self.menuBar().addMenu("&File")
         file_menu.addAction(self.add_action)
         file_menu.addAction(self.remove_action)
