@@ -113,6 +113,7 @@ class MainWindow(QMainWindow):
 
         self.scan_button = QPushButton("Scan for motion")
         self.scan_button.setDefault(True)
+        self.scan_button.setEnabled(False)  # until a valid video is loaded
         self.scan_button.clicked.connect(self._start_scan)
         layout.addWidget(self.scan_button)
 
@@ -275,6 +276,7 @@ class MainWindow(QMainWindow):
             return
         self.input_edit.setText(path)
         self.player.setSource(QUrl.fromLocalFile(path))
+        self.scan_button.setEnabled(True)
         self._set_status(f"Loaded {os.path.basename(path)}")
 
     # ---- scanning ---------------------------------------------------------
