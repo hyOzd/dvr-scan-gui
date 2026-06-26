@@ -61,6 +61,10 @@ _VIDEO_FILTER = (
     "All files (*)"
 )
 
+# While playing, consecutive Previous presses within this window step one
+# event further back each time (instead of re-snapping to the current event).
+_PREV_CHAIN_SECONDS = 2.0
+
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
@@ -73,9 +77,21 @@ class MainWindow(QMainWindow):
         self._items: dict[str, QListWidgetItem] = {}
         self._current_path: str | None = None
         self._events: list[MotionEvent] = []  # events of the selected file
-        # A seek to apply once the next file's media has loaded (used when
-        # event navigation rolls over into an adjacent file).
-        self._pending_seek_ms: int | None = None
+        # A deferred seek + play state applied once a freshly selected file's
+        # media has loaded. Selecting a file previews its first frame (paused);
+        # rolling over between files via event navigation carries the play
+        # state and seeks to the target event.
+        self._pending_load = False
+        self._pending_seek_ms = 0
+        self._pending_autoplay = False
+        # A seek (and optional pause) applied on the first positionChanged after
+        # a freshly loaded file starts playing — a seek issued any earlier on a
+        # new source is dropped, so playback would start from the file's start.
+        self._post_play_seek_ms: int | None = None
+        self._post_play_pause = False
+        # Tracks a run of Previous presses so they walk backwards during playback.
+        self._last_prev_time: float | None = None
+        self._last_prev_start_ms: int | None = None
 
         # Batch-scan bookkeeping.
         self._batch: set[str] = set()
@@ -285,7 +301,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(region_row)
 
         self.timeline = TimelineSeekBar()
-        self.timeline.seekRequested.connect(self._seek)
+        self.timeline.seekRequested.connect(self._on_user_seek)
         layout.addWidget(self.timeline)
 
         controls = QHBoxLayout()
@@ -380,6 +396,8 @@ class MainWindow(QMainWindow):
         self.player.setVideoOutput(self.video_view.video_item)
         self.player.positionChanged.connect(self._on_position_changed)
         self.player.durationChanged.connect(self._on_duration_changed)
+        self.player.mediaStatusChanged.connect(self._on_media_status_changed)
+        self.player.seekableChanged.connect(self._on_seekable_changed)
         self.player.metaDataChanged.connect(self._on_metadata_changed)
         self.player.playbackStateChanged.connect(self._on_playback_state_changed)
         self.player.errorOccurred.connect(self._on_player_error)
@@ -484,6 +502,9 @@ class MainWindow(QMainWindow):
 
         if current is None:
             self._current_path = None
+            self._pending_load = False
+            self._post_play_seek_ms = None
+            self._post_play_pause = False
             self.player.setSource(QUrl())
             self.video_view.set_regions([])
             self._show_events([])
@@ -500,11 +521,16 @@ class MainWindow(QMainWindow):
         entry = self._entries.get(path)
         if entry is None:
             return
+        self._reset_prev_chain()
         self._current_path = path
         self.remove_button.setEnabled(not self._scanning_active)
         self.remove_action.setEnabled(not self._scanning_active)
 
         self.player.setSource(QUrl.fromLocalFile(path))
+        # Show the first frame as soon as the media loads, without playing.
+        self._pending_load = True
+        self._pending_seek_ms = 0
+        self._pending_autoplay = False
 
         self.region_enabled_check.blockSignals(True)
         self.region_enabled_check.setChecked(entry.region_enabled)
@@ -800,12 +826,18 @@ class MainWindow(QMainWindow):
     def _on_result_activated(self, _item: QTableWidgetItem) -> None:
         event = self._selected_event()
         if event is not None:
+            self._reset_prev_chain()
             self._seek(event.start_ms)
             self.player.play()
 
     # ---- event navigation -------------------------------------------------
 
+    def _reset_prev_chain(self) -> None:
+        self._last_prev_time = None
+        self._last_prev_start_ms = None
+
     def _next_event(self) -> None:
+        self._reset_prev_chain()  # any forward move ends a Previous run
         position = self.player.position()
         nxt = next((e for e in self._events if e.start_ms > position + 50), None)
         if nxt is not None:
@@ -815,15 +847,35 @@ class MainWindow(QMainWindow):
             self._jump_file(+1)
 
     def _prev_event(self) -> None:
-        position = self.player.position()
+        playing = (
+            self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+        )
+        now = time.monotonic()
+        # While playing, the playhead drifts forward after each jump, so using
+        # the live position would just re-snap to the event we just landed on.
+        # If this is a quick follow-up Previous, step back from the last landing
+        # instead. When paused the playhead stays put, so position is fine.
+        chained = (
+            playing
+            and self._last_prev_time is not None
+            and (now - self._last_prev_time) <= _PREV_CHAIN_SECONDS
+            and self._last_prev_start_ms is not None
+        )
+        reference = (
+            self._last_prev_start_ms if chained else self.player.position()
+        )
         prev = next(
-            (e for e in reversed(self._events) if e.start_ms < position - 50), None
+            (e for e in reversed(self._events) if e.start_ms < reference - 50), None
         )
         if prev is not None:
             self._goto_event(prev)
+            self._last_prev_start_ms = prev.start_ms
         else:
-            # Before the first event (or no events) — roll over to the previous file.
+            # Before the first event (or no events) — roll over to the previous
+            # file; the chain continues into its last event.
             self._jump_file(-1)
+            self._last_prev_start_ms = self._pending_seek_ms or None
+        self._last_prev_time = now
 
     def _goto_event(self, event: MotionEvent) -> None:
         self._seek(event.start_ms)
@@ -844,11 +896,19 @@ class MainWindow(QMainWindow):
             )
             return
 
+        # Only keep playing across files if we were already playing this one.
+        was_playing = (
+            self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+        )
         target = paths[target_index]
         entry = self._entries[target]
         # Selecting the item loads the file and (synchronously) swaps in its
-        # events; the actual seek waits until the new media reports a duration.
+        # events; the actual seek + resume waits until the new media loads.
         self.file_list.setCurrentItem(self._items[target])
+        # _select_file queued a paused first-frame preview — override it with
+        # the target event and the carried-over play state.
+        self._pending_load = True
+        self._pending_autoplay = was_playing
         if entry.events:
             event = entry.events[0] if direction > 0 else entry.events[-1]
             self._pending_seek_ms = event.start_ms
@@ -859,6 +919,11 @@ class MainWindow(QMainWindow):
             self._pending_seek_ms = 0
 
     # ---- player callbacks -------------------------------------------------
+
+    def _on_user_seek(self, position_ms: int) -> None:
+        # Scrubbing the timeline ends any Previous run.
+        self._reset_prev_chain()
+        self._seek(position_ms)
 
     def _seek(self, position_ms: int) -> None:
         self.player.setPosition(int(position_ms))
@@ -876,6 +941,21 @@ class MainWindow(QMainWindow):
     def _on_position_changed(self, position_ms: int) -> None:
         self.timeline.set_position(position_ms)
         self._update_time_label(position_ms, self.player.duration())
+        if self._post_play_seek_ms is not None or self._post_play_pause:
+            self._apply_post_play()
+
+    def _apply_post_play(self) -> None:
+        # Now that the freshly loaded file is running, pause first (for a
+        # preview) so the seek lands on a warm-but-paused pipeline and the
+        # target frame stays on screen.
+        if self._post_play_pause:
+            self._post_play_pause = False
+            self.player.pause()
+        if self._post_play_seek_ms is not None:
+            target = self._post_play_seek_ms
+            self._post_play_seek_ms = None
+            self.player.setPosition(target)
+            self.timeline.set_position(target)
 
     def _on_metadata_changed(self) -> None:
         # Feed the source resolution to the view as soon as it's known, so the
@@ -889,11 +969,46 @@ class MainWindow(QMainWindow):
     def _on_duration_changed(self, duration_ms: int) -> None:
         self.timeline.set_duration(duration_ms)
         self._update_time_label(self.player.position(), duration_ms)
-        # Apply a seek deferred from cross-file event navigation.
-        if self._pending_seek_ms is not None and duration_ms > 0:
-            target = self._pending_seek_ms
-            self._pending_seek_ms = None
-            self._seek(target)
+        if duration_ms > 0:
+            self._apply_pending_playback()
+
+    def _on_media_status_changed(self, status: QMediaPlayer.MediaStatus) -> None:
+        if status in (
+            QMediaPlayer.MediaStatus.LoadedMedia,
+            QMediaPlayer.MediaStatus.BufferedMedia,
+        ):
+            self._apply_pending_playback()
+
+    def _on_seekable_changed(self, _seekable: bool) -> None:
+        self._apply_pending_playback()
+
+    def _apply_pending_playback(self) -> None:
+        """Once a newly selected file is loaded, seek and set its play state."""
+        if not self._pending_load:
+            return
+        # A seek is silently dropped until the media is seekable, which is why
+        # playback would otherwise start from the file's start. Keep the pending
+        # load and let a later signal re-apply it once the media is ready.
+        if self._pending_seek_ms and not self.player.isSeekable():
+            return
+        self._pending_load = False
+        target = self._pending_seek_ms
+        autoplay = self._pending_autoplay
+        self._pending_autoplay = False
+
+        if not target:
+            # No seek needed (plain selection): render the first frame at once.
+            self.player.play()
+            if not autoplay:
+                self.player.pause()
+            return
+
+        # A non-zero seek on a freshly loaded source is dropped until the
+        # pipeline is running, so start playback and apply the seek (and the
+        # pause, for a preview) on the first positionChanged.
+        self._post_play_seek_ms = target
+        self._post_play_pause = not autoplay
+        self.player.play()
 
     def _update_time_label(self, position_ms: int, duration_ms: int) -> None:
         self.time_label.setText(
