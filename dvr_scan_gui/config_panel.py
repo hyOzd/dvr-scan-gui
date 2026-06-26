@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QComboBox,
@@ -117,6 +119,23 @@ class ConfigPanel(QWidget):
         perf_form.addRow("Frame skip", self.frame_skip)
 
         layout.addWidget(perf)
+
+        # --- Scanning (how many files to process at once) --------------
+        scanning = QGroupBox("Scanning")
+        scanning_form = QFormLayout(scanning)
+
+        self.cores_spin = QSpinBox()
+        cpu = os.cpu_count() or 1
+        self.cores_spin.setRange(1, max(1, cpu))
+        # About half the cores by default — enough to parallelize without
+        # oversubscribing (each dvr-scan process is itself multi-threaded).
+        self.cores_spin.setValue(max(1, cpu // 2))
+        self.cores_spin.setToolTip(
+            f"How many files to scan at once (1–{max(1, cpu)} cores available)."
+        )
+        scanning_form.addRow("Parallel scans", self.cores_spin)
+
+        layout.addWidget(scanning)
         layout.addStretch(1)
 
         # Re-emit a single `changed` signal whenever any option is edited.

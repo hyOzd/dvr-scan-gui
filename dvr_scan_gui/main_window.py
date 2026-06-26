@@ -110,7 +110,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._build_player()
 
-        self._scanner.set_max_concurrent(self.cores_spin.value())
+        self._scanner.set_max_concurrent(self.config_panel.cores_spin.value())
         self._update_scan_buttons()
 
         if self._scanner.executable() is None:
@@ -206,20 +206,6 @@ class MainWindow(QMainWindow):
         self.cancel_button.clicked.connect(self._cancel_all)
         layout.addWidget(self.cancel_button)
 
-        cores_row = QHBoxLayout()
-        cores_row.addWidget(QLabel("Parallel scans"))
-        self.cores_spin = QSpinBox()
-        cpu = os.cpu_count() or 1
-        self.cores_spin.setRange(1, max(1, cpu))
-        self.cores_spin.setValue(self._default_cores())
-        self.cores_spin.setToolTip(
-            f"How many files to scan at once (1–{max(1, cpu)} cores available)."
-        )
-        self.cores_spin.valueChanged.connect(self._on_cores_changed)
-        cores_row.addWidget(self.cores_spin)
-        cores_row.addStretch(1)
-        layout.addLayout(cores_row)
-
         self.total_progress = QProgressBar()
         self.total_progress.setRange(0, 100)
         self.total_progress.setValue(0)
@@ -246,6 +232,7 @@ class MainWindow(QMainWindow):
                              " { background: transparent; }")
         self.config_panel = ConfigPanel()
         self.config_panel.changed.connect(self._refresh_all_rows)
+        self.config_panel.cores_spin.valueChanged.connect(self._on_cores_changed)
         scroll.setWidget(self.config_panel)
         layout.addWidget(scroll, 1)
 
@@ -401,12 +388,6 @@ class MainWindow(QMainWindow):
         self.player.metaDataChanged.connect(self._on_metadata_changed)
         self.player.playbackStateChanged.connect(self._on_playback_state_changed)
         self.player.errorOccurred.connect(self._on_player_error)
-
-    @staticmethod
-    def _default_cores() -> int:
-        # Use about half the cores by default — enough to parallelize without
-        # oversubscribing (each dvr-scan process is itself multi-threaded).
-        return max(1, (os.cpu_count() or 2) // 2)
 
     # ---- file list management --------------------------------------------
 
@@ -639,7 +620,7 @@ class MainWindow(QMainWindow):
 
         self._batch = set(paths)
         self._batch_start = time.monotonic()
-        self._scanner.set_max_concurrent(self.cores_spin.value())
+        self._scanner.set_max_concurrent(self.config_panel.cores_spin.value())
         self._set_scanning(True)
         self.left_tabs.setCurrentIndex(self._files_tab_index)
 
@@ -662,7 +643,6 @@ class MainWindow(QMainWindow):
         self._scanning_active = active
         self.cancel_button.setEnabled(active)
         self.config_panel.set_enabled(not active)
-        self.cores_spin.setEnabled(not active)
         self.add_button.setEnabled(not active)
         self.add_action.setEnabled(not active)
         self.region_enabled_check.setEnabled(not active)
