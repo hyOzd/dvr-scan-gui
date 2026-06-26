@@ -13,7 +13,6 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
     QFileDialog,
-    QFrame,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -130,8 +129,16 @@ class MainWindow(QMainWindow):
         )
         self.left_tabs.addTab(self._build_config_side(), "Configuration")
 
+        # The scan controls live below the tabs so they stay visible — and
+        # usable — no matter which tab is selected.
+        left_container = QWidget()
+        left_layout = QVBoxLayout(left_container)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.addWidget(self.left_tabs, 1)
+        left_layout.addWidget(self._build_scan_controls())
+
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(self.left_tabs)
+        splitter.addWidget(left_container)
         splitter.addWidget(self._build_player_side())
         splitter.addWidget(self._build_results_side())
         splitter.setStretchFactor(0, 0)
@@ -177,7 +184,11 @@ class MainWindow(QMainWindow):
         hint.setStyleSheet("color: gray; font-size: 11px;")
         layout.addWidget(hint)
 
-        layout.addWidget(self._hline())
+        return container
+
+    def _build_scan_controls(self) -> QWidget:
+        container = QWidget()
+        layout = QVBoxLayout(container)
 
         self.scan_selected_button = QPushButton("Scan selected")
         self.scan_selected_button.setEnabled(False)
@@ -223,8 +234,6 @@ class MainWindow(QMainWindow):
     def _build_config_side(self) -> QWidget:
         container = QWidget()
         layout = QVBoxLayout(container)
-        # Keep the style's default layout margins (theme/platform dependent)
-        # rather than zeroing them out — that was what made this look cramped.
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -392,13 +401,6 @@ class MainWindow(QMainWindow):
         self.player.metaDataChanged.connect(self._on_metadata_changed)
         self.player.playbackStateChanged.connect(self._on_playback_state_changed)
         self.player.errorOccurred.connect(self._on_player_error)
-
-    @staticmethod
-    def _hline() -> QFrame:
-        line = QFrame()
-        line.setFrameShape(QFrame.Shape.HLine)
-        line.setFrameShadow(QFrame.Shadow.Sunken)
-        return line
 
     @staticmethod
     def _default_cores() -> int:
