@@ -95,6 +95,7 @@ class ScanOptions:
     start_time: str = ""
     end_time: str = ""
     duration: str = ""
+    region_points: list[tuple[int, int]] | None = None
 
     def to_args(self) -> list[str]:
         args = [
@@ -119,6 +120,11 @@ class ScanOptions:
             args += ["-dt", self.duration.strip()]
         elif self.end_time.strip():
             args += ["-et", self.end_time.strip()]
+        if self.region_points and len(self.region_points) >= 3:
+            # -a takes a flat sequence of X Y coordinates forming a polygon.
+            args.append("-a")
+            for x, y in self.region_points:
+                args += [str(x), str(y)]
         return args
 
 

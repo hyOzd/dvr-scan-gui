@@ -61,6 +61,25 @@ class ScanOptionsTests(unittest.TestCase):
         self.assertIn("-dt", args)
         self.assertNotIn("-et", args)
 
+    def test_region_points_flattened_after_a_flag(self):
+        args = ScanOptions(
+            input_path="x.mp4",
+            region_points=[(10, 20), (110, 20), (110, 220), (10, 220)],
+        ).to_args()
+        i = args.index("-a")
+        self.assertEqual(
+            args[i + 1 : i + 9],
+            ["10", "20", "110", "20", "110", "220", "10", "220"],
+        )
+
+    def test_no_region_flag_without_points(self):
+        self.assertNotIn("-a", ScanOptions(input_path="x.mp4").to_args())
+        # Fewer than 3 points is not a valid polygon and must be skipped.
+        self.assertNotIn(
+            "-a",
+            ScanOptions(input_path="x.mp4", region_points=[(1, 2), (3, 4)]).to_args(),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

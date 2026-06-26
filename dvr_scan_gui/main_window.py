@@ -6,8 +6,7 @@ import os
 
 from PySide6.QtCore import QStandardPaths, Qt, QUrl
 from PySide6.QtGui import QAction, QKeySequence
-from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
-from PySide6.QtMultimediaWidgets import QVideoWidget
+from PySide6.QtMultimedia import QAudioOutput, QMediaMetaData, QMediaPlayer
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QFileDialog,
@@ -32,6 +31,7 @@ from PySide6.QtWidgets import (
 from .config_panel import ConfigPanel
 from .scanner import MotionEvent, Scanner, ms_to_timecode
 from .timeline import TimelineSeekBar
+from .video_view import VideoView
 
 _VIDEO_FILTER = (
     "Video files (*.mp4 *.avi *.mkv *.mov *.m4v *.mpg *.mpeg *.wmv *.flv *.webm);;"
@@ -123,10 +123,29 @@ class MainWindow(QMainWindow):
         container = QWidget()
         layout = QVBoxLayout(container)
 
-        self.video_widget = QVideoWidget()
-        self.video_widget.setMinimumSize(480, 300)
-        self.video_widget.setStyleSheet("background-color: black;")
-        layout.addWidget(self.video_widget, 1)
+        self.video_view = VideoView()
+        self.video_view.regionChanged.connect(self._on_region_changed)
+        layout.addWidget(self.video_view, 1)
+
+        # Detection-region controls.
+        region_row = QHBoxLayout()
+        self.region_button = QPushButton("Define region")
+        self.region_button.setCheckable(True)
+        self.region_button.setToolTip(
+            "Draw a rectangle on the video to limit motion detection to that area."
+        )
+        self.region_button.toggled.connect(self._on_region_toggled)
+        region_row.addWidget(self.region_button)
+
+        self.clear_region_button = QPushButton("Clear region")
+        self.clear_region_button.setEnabled(False)
+        self.clear_region_button.clicked.connect(self.video_view.clear_region)
+        region_row.addWidget(self.clear_region_button)
+
+        self.region_label = QLabel("No region — scanning the full frame.")
+        self.region_label.setStyleSheet("color: gray;")
+        region_row.addWidget(self.region_label, 1)
+        layout.addLayout(region_row)
 
         self.timeline = TimelineSeekBar()
         self.timeline.seekRequested.connect(self._seek)
@@ -199,9 +218,10 @@ class MainWindow(QMainWindow):
         self.audio = QAudioOutput(self)
         self.audio.setVolume(0.8)
         self.player.setAudioOutput(self.audio)
-        self.player.setVideoOutput(self.video_widget)
+        self.player.setVideoOutput(self.video_view.video_item)
         self.player.positionChanged.connect(self._on_position_changed)
         self.player.durationChanged.connect(self._on_duration_changed)
+        self.player.metaDataChanged.connect(self._on_metadata_changed)
         self.player.playbackStateChanged.connect(self._on_playback_state_changed)
         self.player.errorOccurred.connect(self._on_player_error)
 
@@ -239,6 +259,7 @@ class MainWindow(QMainWindow):
             return
         self._load_input(path)
         options = self.config_panel.options(path)
+        options.region_points = self.video_view.region_points()
         self.progress.setValue(0)
         self._set_scanning(True)
         self._set_status("Scanning for motion…")
@@ -249,6 +270,34 @@ class MainWindow(QMainWindow):
         self.cancel_button.setEnabled(scanning)
         self.config_panel.set_enabled(not scanning)
         self.input_edit.setEnabled(not scanning)
+        self.region_button.setEnabled(not scanning)
+        self.clear_region_button.setEnabled(
+            not scanning and self.video_view.has_region()
+        )
+
+    # ---- detection region -------------------------------------------------
+
+    def _on_region_toggled(self, checked: bool) -> None:
+        if checked and not self.video_view.can_edit():
+            self.region_button.setChecked(False)
+            self._set_status("Load a video before defining a region.")
+            return
+        self.video_view.set_edit_mode(checked)
+        if checked:
+            self.region_label.setText("Drag on the video to draw a region.")
+        elif not self.video_view.has_region():
+            self.region_label.setText("No region — scanning the full frame.")
+
+    def _on_region_changed(self, has_region: bool) -> None:
+        self.clear_region_button.setEnabled(has_region)
+        points = self.video_view.region_points()
+        if has_region and points:
+            (x0, y0), _, (x1, y1), _ = points
+            self.region_label.setText(
+                f"Region: {x1 - x0}×{y1 - y0}px at ({x0}, {y0})."
+            )
+        else:
+            self.region_label.setText("No region — scanning the full frame.")
 
     def _on_progress(self, value: int) -> None:
         self.progress.setValue(value)
@@ -322,6 +371,13 @@ class MainWindow(QMainWindow):
     def _on_position_changed(self, position_ms: int) -> None:
         self.timeline.set_position(position_ms)
         self._update_time_label(position_ms, self.player.duration())
+
+    def _on_metadata_changed(self) -> None:
+        # Feed the source resolution to the view as soon as it's known, so the
+        # region editor can map screen coordinates to video pixels.
+        resolution = self.player.metaData().value(QMediaMetaData.Key.Resolution)
+        if resolution is not None:
+            self.video_view.set_video_size(resolution)
 
     def _on_duration_changed(self, duration_ms: int) -> None:
         self.timeline.set_duration(duration_ms)
