@@ -92,7 +92,9 @@ pipenv run python -m dvr_scan_gui
 5. As each file finishes, its events appear on the seek bar and results table.
    You can select and play any finished file while others are still scanning.
 6. **Double-click** any event to jump to it and start playback, or click once
-   to highlight it on the timeline.
+   to highlight it on the timeline. The **⏮ / ⏭** buttons beside Play step to
+   the previous / next detected event; stepping past the last event jumps to the
+   next file (and stepping before the first event jumps to the previous file).
 7. Click **Cancel** to stop a running batch; files already finished keep their
    results. Changing a setting or a file's region marks scanned files as
    **Needs update** so **Scan all** will refresh them.

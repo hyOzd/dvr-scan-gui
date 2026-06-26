@@ -73,6 +73,9 @@ class MainWindow(QMainWindow):
         self._items: dict[str, QListWidgetItem] = {}
         self._current_path: str | None = None
         self._events: list[MotionEvent] = []  # events of the selected file
+        # A seek to apply once the next file's media has loaded (used when
+        # event navigation rolls over into an adjacent file).
+        self._pending_seek_ms: int | None = None
 
         # Batch-scan bookkeeping.
         self._batch: set[str] = set()
@@ -286,12 +289,34 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.timeline)
 
         controls = QHBoxLayout()
+        self.prev_event_button = QPushButton()
+        self.prev_event_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_MediaSkipBackward)
+        )
+        self.prev_event_button.setToolTip(
+            "Previous event (at the start, jumps to the previous file's last event)."
+        )
+        self.prev_event_button.setEnabled(False)
+        self.prev_event_button.clicked.connect(self._prev_event)
+        controls.addWidget(self.prev_event_button)
+
         self.play_button = QPushButton()
         self.play_button.setIcon(
             self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay)
         )
         self.play_button.clicked.connect(self._toggle_play)
         controls.addWidget(self.play_button)
+
+        self.next_event_button = QPushButton()
+        self.next_event_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_MediaSkipForward)
+        )
+        self.next_event_button.setToolTip(
+            "Next event (at the end, jumps to the next file's first event)."
+        )
+        self.next_event_button.setEnabled(False)
+        self.next_event_button.clicked.connect(self._next_event)
+        controls.addWidget(self.next_event_button)
 
         self.time_label = QLabel("00:00:00.000 / 00:00:00.000")
         controls.addWidget(self.time_label)
@@ -464,6 +489,8 @@ class MainWindow(QMainWindow):
             self._show_events([])
             self.remove_button.setEnabled(False)
             self.remove_action.setEnabled(False)
+            self.prev_event_button.setEnabled(False)
+            self.next_event_button.setEnabled(False)
             self._update_scan_buttons()
             return
 
@@ -486,6 +513,8 @@ class MainWindow(QMainWindow):
         self._apply_regions_for_current()
 
         self._show_events(entry.events)
+        self.prev_event_button.setEnabled(True)
+        self.next_event_button.setEnabled(True)
         self._set_status(f"Loaded {entry.name}")
         self._update_scan_buttons()
 
@@ -774,6 +803,61 @@ class MainWindow(QMainWindow):
             self._seek(event.start_ms)
             self.player.play()
 
+    # ---- event navigation -------------------------------------------------
+
+    def _next_event(self) -> None:
+        position = self.player.position()
+        nxt = next((e for e in self._events if e.start_ms > position + 50), None)
+        if nxt is not None:
+            self._goto_event(nxt)
+        else:
+            # Past the last event (or no events) — roll over to the next file.
+            self._jump_file(+1)
+
+    def _prev_event(self) -> None:
+        position = self.player.position()
+        prev = next(
+            (e for e in reversed(self._events) if e.start_ms < position - 50), None
+        )
+        if prev is not None:
+            self._goto_event(prev)
+        else:
+            # Before the first event (or no events) — roll over to the previous file.
+            self._jump_file(-1)
+
+    def _goto_event(self, event: MotionEvent) -> None:
+        self._seek(event.start_ms)
+        row = event.index - 1
+        if 0 <= row < self.results_table.rowCount():
+            self.results_table.selectRow(row)
+
+    def _jump_file(self, direction: int) -> None:
+        paths = self._ordered_paths()
+        if self._current_path is None or self._current_path not in paths:
+            return
+        target_index = paths.index(self._current_path) + direction
+        if not 0 <= target_index < len(paths):
+            self._set_status(
+                "Already at the last event."
+                if direction > 0
+                else "Already at the first event."
+            )
+            return
+
+        target = paths[target_index]
+        entry = self._entries[target]
+        # Selecting the item loads the file and (synchronously) swaps in its
+        # events; the actual seek waits until the new media reports a duration.
+        self.file_list.setCurrentItem(self._items[target])
+        if entry.events:
+            event = entry.events[0] if direction > 0 else entry.events[-1]
+            self._pending_seek_ms = event.start_ms
+            row = event.index - 1
+            if 0 <= row < self.results_table.rowCount():
+                self.results_table.selectRow(row)
+        else:
+            self._pending_seek_ms = 0
+
     # ---- player callbacks -------------------------------------------------
 
     def _seek(self, position_ms: int) -> None:
@@ -805,6 +889,11 @@ class MainWindow(QMainWindow):
     def _on_duration_changed(self, duration_ms: int) -> None:
         self.timeline.set_duration(duration_ms)
         self._update_time_label(self.player.position(), duration_ms)
+        # Apply a seek deferred from cross-file event navigation.
+        if self._pending_seek_ms is not None and duration_ms > 0:
+            target = self._pending_seek_ms
+            self._pending_seek_ms = None
+            self._seek(target)
 
     def _update_time_label(self, position_ms: int, duration_ms: int) -> None:
         self.time_label.setText(
