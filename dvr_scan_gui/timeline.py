@@ -19,6 +19,8 @@ from datetime import datetime, timedelta
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import (
     QColor,
+    QFont,
+    QFontMetrics,
     QMouseEvent,
     QPainter,
     QPainterPath,
@@ -123,6 +125,23 @@ class TimelineSeekBar(QWidget):
     _LABEL_H = 18
     _HANDLE_HALF = 7  # px hit radius around a handle
 
+    # Timeline tick levels, coarsest first. A level is only drawn when its
+    # interval is long enough that consecutive ticks stay at least
+    # ``_TICK_MIN_PX`` apart, so short clips never sprout levels they don't
+    # need (a same-day clip shows no 'day' ticks, and so on).
+    _TICK_LEVELS = ("day", "hour", "q", "min")
+    _TICK_INTERVAL = {"day": 86_400_000, "hour": 3_600_000, "q": 900_000, "min": 60_000}
+    _TICK_MIN_PX = {"day": 8.0, "hour": 8.0, "q": 10.0, "min": 7.0}
+    _TICK_LEN = {"day": 12.0, "hour": 9.0, "q": 6.0, "min": 4.0}
+    _TICK_ORDER = {"day": 0, "hour": 1, "q": 2, "min": 3}
+    _TICK_COLOR = {
+        "day": QColor(205, 205, 215),
+        "hour": QColor(175, 175, 190),
+        "q": QColor(135, 135, 150),
+        "min": QColor(105, 105, 120),
+    }
+    _TICK_LABEL_COLOR = QColor(165, 165, 178)
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._duration_ms = 0
@@ -139,7 +158,7 @@ class TimelineSeekBar(QWidget):
         # shown as wall-clock timestamps (with date) instead of file offsets.
         self._start_dt: datetime | None = None
         self._real_time = False
-        self.setMinimumHeight(58)
+        self.setMinimumHeight(66)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -267,9 +286,11 @@ class TimelineSeekBar(QWidget):
     # ---- geometry helpers -------------------------------------------------
 
     def _track_rect(self) -> QRectF:
+        # The track sits just below the label row; the tick ruler occupies the
+        # space underneath it.
         margin = 8.0
-        height = 16.0
-        top = self._LABEL_H + (self.height() - self._LABEL_H - height) / 2
+        height = 14.0
+        top = self._LABEL_H + 4.0
         return QRectF(margin, top, max(0.0, self.width() - 2 * margin), height)
 
     def _x_to_ms(self, x: float) -> int:
@@ -319,12 +340,17 @@ class TimelineSeekBar(QWidget):
         if self._duration_ms > 0:
             self._paint_range(painter, track)
 
-        # Playhead.
+        # Timeline ruler (multi-level ticks + labels) beneath the track.
+        if self._duration_ms > 0:
+            self._paint_ticks(painter, track)
+
+        # Playhead, extended down through the ruler.
         if self._duration_ms > 0:
             x = self._ms_to_x(self._position_ms)
             painter.setPen(self._PLAYHEAD_COLOR)
             painter.setBrush(self._PLAYHEAD_COLOR)
-            painter.drawRect(QRectF(x - 1.0, track.top() - 4, 2.0, track.height() + 8))
+            bottom = track.bottom() + 3 + self._TICK_LEN["day"]
+            painter.drawRect(QRectF(x - 1.0, track.top() - 4, 2.0, bottom - (track.top() - 4)))
 
     def _paint_range(self, painter: QPainter, track: QRectF) -> None:
         start_x = self._ms_to_x(self._eff_start())
@@ -364,6 +390,135 @@ class TimelineSeekBar(QWidget):
             QPointF(x, bottom),
             QPointF(x + arm, bottom),
         ]))
+
+    # ---- timeline ruler ---------------------------------------------------
+
+    def _boundaries(self, interval: int) -> list[tuple[int, datetime | None, int]]:
+        """Enumerate tick boundaries for ``interval`` (ms) that fall in the clip.
+
+        Returns ``(offset_ms, wall_time_or_None, align_value)`` tuples. In
+        real-time mode boundaries align to the wall clock (midnight, the top of
+        the hour, …); otherwise they align to the file's own zero. The
+        ``align_value`` is the time from that origin and is what classifies a
+        boundary's coarsest level.
+        """
+        duration = self._duration_ms
+        out: list[tuple[int, datetime | None, int]] = []
+        if duration <= 0 or interval <= 0:
+            return out
+        if self._use_real() and self._start_dt is not None:
+            midnight = self._start_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+            base_off = int(round((self._start_dt - midnight).total_seconds() * 1000))
+            align = math.ceil(base_off / interval) * interval
+            offset = align - base_off
+            while offset <= duration:
+                wall = midnight + timedelta(milliseconds=align)
+                out.append((offset, wall, align))
+                align += interval
+                offset += interval
+        else:
+            align = 0
+            while align <= duration:
+                out.append((align, None, align))
+                align += interval
+        return out
+
+    @staticmethod
+    def _classify(align: int) -> str:
+        """The coarsest tick level a boundary at ``align`` belongs to."""
+        if align % 86_400_000 == 0:
+            return "day"
+        if align % 3_600_000 == 0:
+            return "hour"
+        if align % 900_000 == 0:
+            return "q"
+        return "min"
+
+    def _tick_label(self, level: str, wall: datetime | None, offset: int) -> str:
+        if wall is not None:
+            return wall.strftime("%b %d") if level == "day" else wall.strftime("%H:%M")
+        total_min = offset // 60_000
+        return f"{total_min // 60}:{total_min % 60:02d}"
+
+    def _build_ticks(self, track: QRectF) -> list[dict]:
+        """Compute the ticks to draw for the current clip, choosing which levels
+        are dense enough to show and which ticks get a (non-overlapping) label."""
+        duration = self._duration_ms
+        if duration <= 0 or track.width() <= 0:
+            return []
+        px_per_ms = track.width() / duration
+        visible = {
+            name for name in self._TICK_LEVELS
+            if self._TICK_INTERVAL[name] * px_per_ms >= self._TICK_MIN_PX[name]
+        }
+        if not visible:
+            return []
+        finest = min(self._TICK_INTERVAL[name] for name in visible)
+        by_interval = {iv: name for name, iv in self._TICK_INTERVAL.items()}
+        finest_name = by_interval[finest]
+
+        ticks: list[dict] = []
+        for offset, wall, align in self._boundaries(finest):
+            if offset <= 0 or offset >= duration:  # the edges carry the handles
+                continue
+            level = self._classify(align)
+            if level not in visible:
+                level = finest_name
+            ticks.append({
+                "x": self._ms_to_x(offset),
+                "level": level,
+                "label": self._tick_label(level, wall, offset),
+            })
+
+        # Thin labels coarse-level-first, keeping each at least ~46px from the
+        # last kept one. Round coarse labels (the hour, midnight) win the slot,
+        # and dense finer labels fall away — so the ruler never crowds.
+        font = QFont(self.font())
+        font.setPixelSize(10)
+        fm = QFontMetrics(font)
+        placed: list[tuple[float, float]] = []
+        for tick in sorted(ticks, key=lambda t: (self._TICK_ORDER[t["level"]], t["x"])):
+            half = max(fm.horizontalAdvance(tick["label"]) / 2 + 4, 23.0)
+            x0, x1 = tick["x"] - half, tick["x"] + half
+            if any(not (x1 <= p0 or x0 >= p1) for p0, p1 in placed):
+                tick["label"] = None
+            else:
+                placed.append((x0, x1))
+        return ticks
+
+    def _paint_ticks(self, painter: QPainter, track: QRectF) -> None:
+        ticks = self._build_ticks(track)
+        if not ticks:
+            return
+        y0 = track.bottom() + 3
+        painter.save()
+        for tick in ticks:
+            level = tick["level"]
+            pen = QPen(self._TICK_COLOR[level])
+            pen.setWidthF(1.2 if level in ("day", "hour") else 1.0)
+            painter.setPen(pen)
+            x = tick["x"]
+            painter.drawLine(QPointF(x, y0), QPointF(x, y0 + self._TICK_LEN[level]))
+
+        font = QFont(self.font())
+        font.setPixelSize(10)
+        painter.setFont(font)
+        painter.setPen(self._TICK_LABEL_COLOR)
+        ly = y0 + self._TICK_LEN["day"] + 1
+        for tick in ticks:
+            if not tick["label"]:
+                continue
+            rect = QRectF(tick["x"] - 40, ly, 80, 12)
+            if rect.left() < 0:
+                rect.moveLeft(0)
+            elif rect.right() > self.width():
+                rect.moveRight(self.width())
+            painter.drawText(
+                rect,
+                Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
+                tick["label"],
+            )
+        painter.restore()
 
     # ---- editable labels --------------------------------------------------
 
