@@ -370,8 +370,10 @@ class MainWindow(QMainWindow):
         self.results_header = QLabel("<b>Detected events</b>")
         layout.addWidget(self.results_header)
 
-        self.results_table = QTableWidget(0, 3)
-        self.results_table.setHorizontalHeaderLabels(["#", "Start", "Duration"])
+        self.results_table = QTableWidget(0, 4)
+        self.results_table.setHorizontalHeaderLabels(
+            ["#", "Start", "Clock time", "Duration"]
+        )
         self.results_table.verticalHeader().setVisible(False)
         self.results_table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
@@ -384,8 +386,9 @@ class MainWindow(QMainWindow):
         )
         header = self.results_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         self.results_table.itemSelectionChanged.connect(self._on_result_selected)
         self.results_table.itemDoubleClicked.connect(self._on_result_activated)
         layout.addWidget(self.results_table, 1)
@@ -856,15 +859,20 @@ class MainWindow(QMainWindow):
     def _populate_results(self, events: list[MotionEvent]) -> None:
         self.results_header.setText(f"<b>Detected events ({len(events)})</b>")
         self.results_table.setRowCount(len(events))
+        start = self._recording_start
         for row, event in enumerate(events):
             index_item = QTableWidgetItem(str(event.index))
             index_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             start_item = QTableWidgetItem(ms_to_timecode(event.start_ms))
+            clock_text = ms_to_realtime(start, event.start_ms) if start else "—"
+            clock_item = QTableWidgetItem(clock_text)
+            clock_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             dur_item = QTableWidgetItem(ms_to_timecode(event.duration_ms))
             dur_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.results_table.setItem(row, 0, index_item)
             self.results_table.setItem(row, 1, start_item)
-            self.results_table.setItem(row, 2, dur_item)
+            self.results_table.setItem(row, 2, clock_item)
+            self.results_table.setItem(row, 3, dur_item)
 
     def _selected_event(self) -> MotionEvent | None:
         row = self.results_table.currentRow()
