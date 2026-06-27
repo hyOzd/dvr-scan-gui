@@ -336,7 +336,11 @@ class MainWindow(QMainWindow):
 
         # Toggles the seek bar / time read-outs between file time and the real
         # recording clock time. Enabled only when the file carries a timestamp.
-        self.time_mode_button = QPushButton("File time")
+        self.time_mode_button = QPushButton()
+        self.time_mode_button.setIcon(
+            tool_icon("clock", self.palette().color(QPalette.ColorRole.ButtonText))
+        )
+        self.time_mode_button.setIconSize(QSize(18, 18))
         self.time_mode_button.setCheckable(True)
         self.time_mode_button.setEnabled(False)
         self.time_mode_button.setToolTip(
@@ -1074,7 +1078,6 @@ class MainWindow(QMainWindow):
         self.player.play()
 
     def _on_time_mode_toggled(self, real_time: bool) -> None:
-        self.time_mode_button.setText("Real time" if real_time else "File time")
         self.timeline.set_time_mode(real_time)
         self._update_time_label(self.player.position(), self.player.duration())
 

@@ -66,11 +66,22 @@ def _draw_delete(p: QPainter, color: QColor) -> None:
         p.drawLine(QPointF(x, 12), QPointF(x, 23))
 
 
+def _draw_clock(p: QPainter, color: QColor) -> None:
+    pen = QPen(color, 2.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
+               Qt.PenJoinStyle.RoundJoin)
+    p.setPen(pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.drawEllipse(QRectF(5, 6, 22, 22))                 # face
+    p.drawLine(QPointF(16, 17), QPointF(16, 11))        # minute hand
+    p.drawLine(QPointF(16, 17), QPointF(21, 19))        # hour hand
+
+
 _DRAWERS = {
     "pointer": _draw_pointer,
     "rectangle": _draw_rectangle,
     "polygon": _draw_polygon,
     "delete": _draw_delete,
+    "clock": _draw_clock,
 }
 
 
