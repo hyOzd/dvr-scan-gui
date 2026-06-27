@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPaintEvent, QPen, QPolygonF
-from PySide6.QtWidgets import QLineEdit, QSizePolicy, QWidget
+from PySide6.QtWidgets import QLabel, QLineEdit, QSizePolicy, QWidget
 
 from .scanner import MotionEvent, ms_to_realtime, ms_to_timecode
 
@@ -74,6 +74,18 @@ class TimelineSeekBar(QWidget):
         self._start_edit.editingFinished.connect(lambda: self._commit_editor("start"))
         self._end_edit.editingFinished.connect(lambda: self._commit_editor("end"))
         self._apply_editor_widths()
+
+        # A read-only label that tracks the cursor and shows the time under it.
+        self._hover_label = QLabel(self)
+        self._hover_label.setVisible(False)
+        self._hover_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._hover_label.setFixedHeight(self._LABEL_H)
+        self._hover_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._hover_label.setStyleSheet(
+            "QLabel { background: #1e1e22; color: #f0f0f0;"
+            " border: 1px solid rgba(245, 245, 245, 0.5); border-radius: 3px;"
+            " padding: 0 4px; font-size: 11px; }"
+        )
 
     def _make_editor(self, accent: QColor) -> QLineEdit:
         edit = QLineEdit(self)
@@ -303,6 +315,19 @@ class TimelineSeekBar(QWidget):
         ms = self._eff_start() if which == "start" else self._eff_end()
         self._editor(which).setText(self._fmt(ms))
 
+    def _show_hover(self, x: float) -> None:
+        """Float the read-out label above the cursor at track position ``x``."""
+        if self._duration_ms <= 0:
+            self._hover_label.setVisible(False)
+            return
+        self._hover_label.setText(self._fmt(self._x_to_ms(x)))
+        self._hover_label.adjustSize()
+        w = self._hover_label.width()
+        lx = max(0.0, min(x - w / 2, self.width() - w))
+        self._hover_label.move(int(lx), 0)
+        self._hover_label.setVisible(True)
+        self._hover_label.raise_()
+
     def _reposition_editors(self) -> None:
         for which in ("start", "end"):
             edit = self._editor(which)
@@ -442,15 +467,18 @@ class TimelineSeekBar(QWidget):
         pos = event.position()
         if self._drag is not None:
             self._move_handle(self._drag, pos.x())
+            self._hover_label.setVisible(False)
             return
         if event.buttons() & Qt.MouseButton.LeftButton:
             self._seek_to_x(pos.x())
         if self._handle_at(pos.x(), pos.y()) is not None:
+            # Over a handle: the bracket's own editor reads out the bound, so
+            # keep the hover label out of the way.
             self.setCursor(Qt.CursorShape.SplitHCursor)
+            self._hover_label.setVisible(False)
         else:
             self.setCursor(Qt.CursorShape.PointingHandCursor)
-        if self._duration_ms > 0:
-            self.setToolTip(self._fmt(self._x_to_ms(pos.x())))
+            self._show_hover(pos.x())
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         if self._drag is not None:
@@ -460,6 +488,10 @@ class TimelineSeekBar(QWidget):
             editor = self._editor(which)
             editor.setFocus(Qt.FocusReason.MouseFocusReason)
             editor.selectAll()
+
+    def leaveEvent(self, event) -> None:  # noqa: N802 (Qt naming)
+        self._hover_label.setVisible(False)
+        super().leaveEvent(event)
 
     def resizeEvent(self, event) -> None:  # noqa: N802 (Qt naming)
         super().resizeEvent(event)
