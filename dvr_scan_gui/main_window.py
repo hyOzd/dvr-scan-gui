@@ -46,7 +46,13 @@ from .file_list import (
     FileListWidget,
 )
 from .icons import tool_icon
-from .scanner import MotionEvent, ScanManager, ms_to_timecode
+from .scanner import (
+    MotionEvent,
+    ScanManager,
+    ms_to_realtime,
+    ms_to_timecode,
+    read_recording_start,
+)
 from .timeline import TimelineSeekBar
 from .video_view import (
     TOOL_DELETE,
@@ -77,6 +83,9 @@ class MainWindow(QMainWindow):
         self._items: dict[str, QListWidgetItem] = {}
         self._current_path: str | None = None
         self._events: list[MotionEvent] = []  # events of the selected file
+        # Real recording start of the selected file (None when its metadata
+        # has no usable timestamp); drives the real-time/file-time display.
+        self._recording_start = None
         # A deferred seek + play state applied once a freshly selected file's
         # media has loaded. Selecting a file previews its first frame (paused);
         # rolling over between files via event navigation carries the play
@@ -324,6 +333,18 @@ class MainWindow(QMainWindow):
 
         self.time_label = QLabel("00:00:00.000 / 00:00:00.000")
         controls.addWidget(self.time_label)
+
+        # Toggles the seek bar / time read-outs between file time and the real
+        # recording clock time. Enabled only when the file carries a timestamp.
+        self.time_mode_button = QPushButton("File time")
+        self.time_mode_button.setCheckable(True)
+        self.time_mode_button.setEnabled(False)
+        self.time_mode_button.setToolTip(
+            "No recording timestamp in this file's metadata."
+        )
+        self.time_mode_button.toggled.connect(self._on_time_mode_toggled)
+        controls.addWidget(self.time_mode_button)
+
         controls.addStretch(1)
 
         controls.addWidget(QLabel("Volume"))
@@ -483,6 +504,12 @@ class MainWindow(QMainWindow):
             self.player.setSource(QUrl())
             self.video_view.set_regions([])
             self.timeline.set_range(None, None)
+            self._recording_start = None
+            self.timeline.set_start_datetime(None)
+            self.time_mode_button.setEnabled(False)
+            self.time_mode_button.setToolTip(
+                "No recording timestamp in this file's metadata."
+            )
             self._show_events([])
             self.remove_button.setEnabled(False)
             self.remove_action.setEnabled(False)
@@ -514,11 +541,37 @@ class MainWindow(QMainWindow):
         self.video_view.set_region_enabled(entry.region_enabled)
         self._apply_regions_for_current()
 
+        self._apply_recording_start(entry)
+
         self._show_events(entry.events)
         self.prev_event_button.setEnabled(True)
         self.next_event_button.setEnabled(True)
         self._set_status(f"Loaded {entry.name}")
         self._update_scan_buttons()
+
+    def _apply_recording_start(self, entry: FileEntry) -> None:
+        """Probe (once) and apply the file's real recording start, wiring up the
+        real-time toggle for the seek bar and time read-outs."""
+        if not entry.start_probed:
+            entry.recording_start = read_recording_start(entry.path)
+            entry.start_probed = True
+        self._recording_start = entry.recording_start
+        self.timeline.set_start_datetime(entry.recording_start)
+
+        has_start = entry.recording_start is not None
+        self.time_mode_button.setEnabled(has_start)
+        if has_start:
+            self.time_mode_button.setToolTip(
+                f"Recording started {ms_to_realtime(entry.recording_start, 0)}.\n"
+                "Toggle the seek bar between file time and real recording time."
+            )
+        else:
+            self.time_mode_button.setToolTip(
+                "No recording timestamp in this file's metadata."
+            )
+        # Keep the user's chosen mode across files; it only takes effect when a
+        # start time is available.
+        self.timeline.set_time_mode(has_start and self.time_mode_button.isChecked())
 
     def _apply_regions_for_current(self) -> None:
         entry = self._entries.get(self._current_path)
@@ -1012,10 +1065,25 @@ class MainWindow(QMainWindow):
         self._post_play_pause = not autoplay
         self.player.play()
 
+    def _on_time_mode_toggled(self, real_time: bool) -> None:
+        self.time_mode_button.setText("Real time" if real_time else "File time")
+        self.timeline.set_time_mode(real_time)
+        self._update_time_label(self.player.position(), self.player.duration())
+
+    def _real_time_active(self) -> bool:
+        return self._recording_start is not None and self.time_mode_button.isChecked()
+
     def _update_time_label(self, position_ms: int, duration_ms: int) -> None:
-        self.time_label.setText(
-            f"{ms_to_timecode(position_ms)} / {ms_to_timecode(duration_ms)}"
-        )
+        if self._real_time_active():
+            start = self._recording_start
+            self.time_label.setText(
+                f"{ms_to_realtime(start, position_ms)} / "
+                f"{ms_to_realtime(start, duration_ms)}"
+            )
+        else:
+            self.time_label.setText(
+                f"{ms_to_timecode(position_ms)} / {ms_to_timecode(duration_ms)}"
+            )
 
     def _on_playback_state_changed(self, state: QMediaPlayer.PlaybackState) -> None:
         playing = state == QMediaPlayer.PlaybackState.PlayingState

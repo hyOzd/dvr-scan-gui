@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import re
 import shutil
+import subprocess
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 
 from PySide6.QtCore import QObject, QProcess, Signal
 
@@ -62,6 +64,46 @@ def ms_to_timecode(ms: int) -> str:
     minutes, ms = divmod(ms, 60_000)
     seconds, ms = divmod(ms, 1000)
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{ms:03d}"
+
+
+def read_recording_start(path: str) -> datetime | None:
+    """Return the real wall-clock time the recording started, or ``None``.
+
+    Reads the video's *Media Create Date* metadata via ``exiftool``. QuickTime
+    / MP4 create-date tags are stored in UTC, so ``-api QuickTimeUTC=1`` is
+    used to convert the value to local time, giving the actual moment the clip
+    began. Returns ``None`` when exiftool is missing, the tag is absent, or the
+    tag holds the QuickTime zero-date sentinel (1904).
+    """
+    exe = shutil.which("exiftool")
+    if not exe:
+        return None
+    try:
+        proc = subprocess.run(
+            [exe, "-api", "QuickTimeUTC=1", "-s3", "-d", "%Y-%m-%d %H:%M:%S",
+             "-MediaCreateDate", path],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    value = proc.stdout.strip()
+    if not value:
+        return None
+    try:
+        start = datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+    # 1904-01-01 is QuickTime's epoch, written when no real date is set.
+    if start.year < 1990:
+        return None
+    return start
+
+
+def ms_to_realtime(start: datetime, ms: int) -> str:
+    """Format a playback offset as a real ``YYYY-MM-DD HH:MM:SS.mmm`` clock
+    time, by adding the offset to the recording start."""
+    t = start + timedelta(milliseconds=max(0, int(ms)))
+    return t.strftime("%Y-%m-%d %H:%M:%S.") + f"{t.microsecond // 1000:03d}"
 
 
 def parse_events(csv_line: str) -> list[MotionEvent]:

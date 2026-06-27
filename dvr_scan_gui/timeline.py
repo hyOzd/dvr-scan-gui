@@ -13,11 +13,13 @@ the track outside the selected range is dimmed.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPaintEvent, QPen, QPolygonF
 from PySide6.QtWidgets import QLineEdit, QSizePolicy, QWidget
 
-from .scanner import MotionEvent, ms_to_timecode
+from .scanner import MotionEvent, ms_to_realtime, ms_to_timecode
 
 
 class TimelineSeekBar(QWidget):
@@ -58,6 +60,10 @@ class TimelineSeekBar(QWidget):
         self._drag: str | None = None      # handle being dragged: 'start'/'end'
         self._active: str | None = None    # handle whose editor is shown
         self._committing = False           # re-entrancy guard for editors
+        # When a recording start is known and real-time mode is on, times are
+        # shown as wall-clock timestamps (with date) instead of file offsets.
+        self._start_dt: datetime | None = None
+        self._real_time = False
         self.setMinimumHeight(58)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setMouseTracking(True)
@@ -67,6 +73,7 @@ class TimelineSeekBar(QWidget):
         self._end_edit = self._make_editor(self._END_COLOR)
         self._start_edit.editingFinished.connect(lambda: self._commit_editor("start"))
         self._end_edit.editingFinished.connect(lambda: self._commit_editor("end"))
+        self._apply_editor_widths()
 
     def _make_editor(self, accent: QColor) -> QLineEdit:
         edit = QLineEdit(self)
@@ -74,12 +81,24 @@ class TimelineSeekBar(QWidget):
         edit.setAlignment(Qt.AlignmentFlag.AlignCenter)
         edit.setFixedHeight(self._LABEL_H)
         edit.setFixedWidth(94)
-        edit.setToolTip("Type a time (SS, MM:SS, or HH:MM:SS).")
         edit.setStyleSheet(
             "QLineEdit { background: #1e1e22; color: #f0f0f0; border: 1px solid %s;"
             " border-radius: 3px; padding: 0 2px; font-size: 11px; }" % accent.name()
         )
         return edit
+
+    def _apply_editor_widths(self) -> None:
+        """Widen the editors to fit a full timestamp in real-time mode, and
+        keep their input hints in sync with the accepted format."""
+        if self._use_real():
+            width = 168
+            tip = "Type a real time (YYYY-MM-DD HH:MM:SS or just HH:MM:SS)."
+        else:
+            width = 94
+            tip = "Type a time (SS, MM:SS, or HH:MM:SS)."
+        for edit in (self._start_edit, self._end_edit):
+            edit.setFixedWidth(width)
+            edit.setToolTip(tip)
 
     # ---- public API -------------------------------------------------------
 
@@ -122,6 +141,38 @@ class TimelineSeekBar(QWidget):
         self._drag = None
         self._set_active(None)
         self.update()
+
+    def set_start_datetime(self, start: datetime | None) -> None:
+        """Provide the real recording start (None disables real-time mode)."""
+        self._start_dt = start
+        if start is None:
+            self._real_time = False
+        self._apply_editor_widths()
+        if self._active is not None:
+            self._update_editor_text(self._active)
+            self._reposition_editors()
+        self.update()
+
+    def set_time_mode(self, real_time: bool) -> None:
+        """Switch the displayed times between file offsets and real clock time.
+
+        Real-time mode only takes effect when a recording start is known.
+        """
+        self._real_time = bool(real_time) and self._start_dt is not None
+        self._apply_editor_widths()
+        if self._active is not None:
+            self._update_editor_text(self._active)
+            self._reposition_editors()
+        self.update()
+
+    def _use_real(self) -> bool:
+        return self._real_time and self._start_dt is not None
+
+    def _fmt(self, ms: int) -> str:
+        """Format a millisecond offset per the current display mode."""
+        if self._use_real():
+            return ms_to_realtime(self._start_dt, ms)
+        return ms_to_timecode(ms)
 
     # ---- range helpers ----------------------------------------------------
 
@@ -250,7 +301,7 @@ class TimelineSeekBar(QWidget):
 
     def _update_editor_text(self, which: str) -> None:
         ms = self._eff_start() if which == "start" else self._eff_end()
-        self._editor(which).setText(ms_to_timecode(ms))
+        self._editor(which).setText(self._fmt(ms))
 
     def _reposition_editors(self) -> None:
         for which in ("start", "end"):
@@ -286,8 +337,52 @@ class TimelineSeekBar(QWidget):
         finally:
             self._committing = False
 
+    def _parse_time(self, text: str) -> int | None:
+        """Parse the editor text into a millisecond offset.
+
+        In real-time mode a wall-clock timestamp is accepted first; otherwise
+        (or as a fallback) a relative file offset is parsed.
+        """
+        if self._use_real():
+            ms = self._parse_realtime(text)
+            if ms is not None:
+                return ms
+        return self._parse_relative(text)
+
+    def _parse_realtime(self, text: str) -> int | None:
+        """Parse a wall-clock timestamp into an offset from the recording start.
+
+        Accepts a full ``YYYY-MM-DD HH:MM:SS(.mmm)`` or a time-only
+        ``HH:MM(:SS(.mmm))`` value (assumed to be on the recording's day, or
+        the next day if it would otherwise precede the start)."""
+        token = text.strip()
+        if not token or self._start_dt is None:
+            return None
+        for fmt, time_only in (
+            ("%Y-%m-%d %H:%M:%S.%f", False),
+            ("%Y-%m-%d %H:%M:%S", False),
+            ("%Y-%m-%d %H:%M", False),
+            ("%H:%M:%S.%f", True),
+            ("%H:%M:%S", True),
+            ("%H:%M", True),
+        ):
+            try:
+                parsed = datetime.strptime(token, fmt)
+            except ValueError:
+                continue
+            if time_only:
+                parsed = self._start_dt.replace(
+                    hour=parsed.hour, minute=parsed.minute,
+                    second=parsed.second, microsecond=parsed.microsecond,
+                )
+                if parsed < self._start_dt:
+                    parsed += timedelta(days=1)
+            delta_ms = (parsed - self._start_dt).total_seconds() * 1000
+            return max(0, int(round(delta_ms)))
+        return None
+
     @staticmethod
-    def _parse_time(text: str) -> int | None:
+    def _parse_relative(text: str) -> int | None:
         """Parse 'SS', 'MM:SS', 'HH:MM:SS(.mmm)', or a plain/seconds value."""
         token = text.strip().lower().rstrip("s").strip()
         if not token:
@@ -355,7 +450,7 @@ class TimelineSeekBar(QWidget):
         else:
             self.setCursor(Qt.CursorShape.PointingHandCursor)
         if self._duration_ms > 0:
-            self.setToolTip(ms_to_timecode(self._x_to_ms(pos.x())))
+            self.setToolTip(self._fmt(self._x_to_ms(pos.x())))
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         if self._drag is not None:

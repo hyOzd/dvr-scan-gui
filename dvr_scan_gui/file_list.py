@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from datetime import datetime
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor
@@ -56,6 +57,11 @@ class FileEntry:
     # (from the start of the file / to the end of the file).
     range_start_ms: int | None = None
     range_end_ms: int | None = None
+    # Real recording start time read from the file's metadata (lazily probed
+    # once: ``start_probed`` guards against re-running exiftool on files that
+    # have no usable timestamp).
+    recording_start: datetime | None = None
+    start_probed: bool = False
 
     @property
     def name(self) -> str:
