@@ -13,13 +13,88 @@ the track outside the selected range is dimmed.
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timedelta
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPaintEvent, QPen, QPolygonF
-from PySide6.QtWidgets import QLabel, QLineEdit, QSizePolicy, QWidget
+from PySide6.QtGui import (
+    QColor,
+    QMouseEvent,
+    QPainter,
+    QPainterPath,
+    QPaintEvent,
+    QPen,
+    QPolygonF,
+)
+from PySide6.QtWidgets import QLineEdit, QSizePolicy, QWidget
 
 from .scanner import MotionEvent, ms_to_realtime, ms_to_timecode
+
+
+class _HoverReadout(QWidget):
+    """A small tooltip-style bubble with a downward tail at its bottom-centre.
+
+    Used as the seek-bar's hover read-out: the tail points down at the track so
+    it reads like a caret marking the position under the cursor.
+    """
+
+    _TAIL_H = 5.0     # height of the pointer triangle
+    _TAIL_HALF = 5.0  # half-width of the pointer triangle's base
+    _PAD_X = 6.0
+    _PAD_Y = 2.0
+    _RADIUS = 3.0
+    _BG = QColor(0x1E, 0x1E, 0x22)
+    _BORDER = QColor(245, 245, 245, 128)
+    _FG = QColor(0xF0, 0xF0, 0xF0)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setVisible(False)
+        self._text = ""
+        font = self.font()
+        font.setPixelSize(11)
+        self.setFont(font)
+
+    def set_text(self, text: str) -> None:
+        if text == self._text:
+            return
+        self._text = text
+        fm = self.fontMetrics()
+        w = fm.horizontalAdvance(text) + 2 * self._PAD_X + 2
+        h = fm.height() + 2 * self._PAD_Y + 2 + self._TAIL_H
+        self.resize(int(math.ceil(w)), int(math.ceil(h)))
+        self.update()
+
+    def paintEvent(self, _event: QPaintEvent) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        body_h = self.height() - self._TAIL_H
+        body = QRectF(0.5, 0.5, self.width() - 1.0, body_h - 1.0)
+        path = QPainterPath()
+        path.addRoundedRect(body, self._RADIUS, self._RADIUS)
+        cx = self.width() / 2.0
+        tail = QPolygonF([
+            QPointF(cx - self._TAIL_HALF, body_h - 1.0),
+            QPointF(cx + self._TAIL_HALF, body_h - 1.0),
+            QPointF(cx, self.height() - 0.5),
+        ])
+        tail_path = QPainterPath()
+        tail_path.addPolygon(tail)
+        outline = path.united(tail_path)
+
+        painter.setBrush(self._BG)
+        pen = QPen(self._BORDER)
+        pen.setWidthF(1.0)
+        painter.setPen(pen)
+        painter.drawPath(outline)
+
+        painter.setPen(self._FG)
+        painter.drawText(
+            QRectF(0, 0, self.width(), body_h),
+            Qt.AlignmentFlag.AlignCenter,
+            self._text,
+        )
 
 
 class TimelineSeekBar(QWidget):
@@ -75,17 +150,9 @@ class TimelineSeekBar(QWidget):
         self._end_edit.editingFinished.connect(lambda: self._commit_editor("end"))
         self._apply_editor_widths()
 
-        # A read-only label that tracks the cursor and shows the time under it.
-        self._hover_label = QLabel(self)
-        self._hover_label.setVisible(False)
-        self._hover_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._hover_label.setFixedHeight(self._LABEL_H)
-        self._hover_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        self._hover_label.setStyleSheet(
-            "QLabel { background: #1e1e22; color: #f0f0f0;"
-            " border: 1px solid rgba(245, 245, 245, 0.5); border-radius: 3px;"
-            " padding: 0 4px; font-size: 11px; }"
-        )
+        # A read-only bubble that tracks the cursor and shows the time under it,
+        # its tail pointing down at the track.
+        self._hover_label = _HoverReadout(self)
 
     def _make_editor(self, accent: QColor) -> QLineEdit:
         edit = QLineEdit(self)
@@ -316,15 +383,17 @@ class TimelineSeekBar(QWidget):
         self._editor(which).setText(self._fmt(ms))
 
     def _show_hover(self, x: float) -> None:
-        """Float the read-out label above the cursor at track position ``x``."""
+        """Float the read-out bubble above the cursor, tail pointing at the
+        track at position ``x``."""
         if self._duration_ms <= 0:
             self._hover_label.setVisible(False)
             return
-        self._hover_label.setText(self._fmt(self._x_to_ms(x)))
-        self._hover_label.adjustSize()
+        self._hover_label.set_text(self._fmt(self._x_to_ms(x)))
         w = self._hover_label.width()
+        h = self._hover_label.height()
         lx = max(0.0, min(x - w / 2, self.width() - w))
-        self._hover_label.move(int(lx), 0)
+        y = max(0.0, self._track_rect().top() - 2 - h)
+        self._hover_label.move(int(lx), int(y))
         self._hover_label.setVisible(True)
         self._hover_label.raise_()
 
