@@ -576,9 +576,10 @@ class MainWindow(QMainWindow):
             self.time_mode_button.setToolTip(
                 "No recording timestamp in this file's metadata."
             )
-        # Keep the user's chosen mode across files; it only takes effect when a
-        # start time is available.
-        self.timeline.set_time_mode(has_start and self.time_mode_button.isChecked())
+        # Default to real recording time whenever the file provides it; fall
+        # back to file time otherwise. The user can still toggle afterward.
+        self.time_mode_button.setChecked(has_start)
+        self.timeline.set_time_mode(has_start)
 
     def _apply_regions_for_current(self) -> None:
         entry = self._entries.get(self._current_path)
