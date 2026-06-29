@@ -125,6 +125,7 @@ class TimelineSeekBar(QWidget):
 
     _LABEL_H = 18
     _HANDLE_HALF = 7  # px hit radius around a handle
+    _MIN_VIEW_MS = 2000  # closest zoom: the visible window never shrinks below this
 
     # Timeline tick levels, coarsest first. A level is only drawn when its
     # interval is long enough that consecutive ticks stay at least
@@ -164,10 +165,20 @@ class TimelineSeekBar(QWidget):
         # line instead of a played fill.
         self._global = False
         self._coverage: list[tuple[int, int]] = []
+        # The visible window into the timeline, in ms. Equal to [0, duration]
+        # when fully zoomed out; the global timeline can zoom (wheel) and pan
+        # (shift+drag) to a sub-range. File mode always keeps it full.
+        self._view_start_ms = 0
+        self._view_end_ms = 0
+        self._panning = False
+        self._pan_anchor_x = 0.0
+        self._pan_anchor_view = (0, 0)
         self.setMinimumHeight(66)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        # Right-drag pans the day timeline, so don't pop a context menu on it.
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
 
         self._start_edit = self._make_editor(self._START_COLOR)
         self._end_edit = self._make_editor(self._END_COLOR)
@@ -207,12 +218,21 @@ class TimelineSeekBar(QWidget):
     # ---- public API -------------------------------------------------------
 
     def set_duration(self, duration_ms: int) -> None:
-        self._duration_ms = max(0, int(duration_ms))
+        new_duration = max(0, int(duration_ms))
+        changed = new_duration != self._duration_ms
+        self._duration_ms = new_duration
         # Keep any bounded range inside the (possibly new) clip length.
         if self._range_start_ms is not None:
             self._range_start_ms = min(self._range_start_ms, self._duration_ms)
         if self._range_end_ms is not None:
             self._range_end_ms = min(self._range_end_ms, self._duration_ms)
+        # A genuinely new length (a different file, or the day view turning on)
+        # resets the zoom; the same length (a global-view refresh) keeps it.
+        if changed or self._view_end_ms <= self._view_start_ms:
+            self._reset_view()
+        else:
+            self._view_end_ms = min(self._view_end_ms, self._duration_ms)
+            self._view_start_ms = max(0, min(self._view_start_ms, self._view_end_ms))
         self._reposition_editors()
         self.update()
 
@@ -278,6 +298,8 @@ class TimelineSeekBar(QWidget):
         if enabled:
             self._drag = None
             self._set_active(None)  # tuck away the range editors
+        self._panning = False
+        self._reset_view()  # always start a mode fully zoomed out
         self.update()
 
     def set_coverage(self, segments: list[tuple[int, int]]) -> None:
@@ -315,19 +337,53 @@ class TimelineSeekBar(QWidget):
         top = self._LABEL_H + 4.0
         return QRectF(margin, top, max(0.0, self.width() - 2 * margin), height)
 
+    def _view_span(self) -> tuple[int, int]:
+        """The visible [start, end] in ms (falls back to the whole clip)."""
+        if self._view_end_ms <= self._view_start_ms:
+            return 0, self._duration_ms
+        return self._view_start_ms, self._view_end_ms
+
     def _x_to_ms(self, x: float) -> int:
         track = self._track_rect()
-        if track.width() <= 0 or self._duration_ms <= 0:
+        start, end = self._view_span()
+        if track.width() <= 0 or end <= start:
             return 0
         ratio = (x - track.left()) / track.width()
-        return int(round(max(0.0, min(1.0, ratio)) * self._duration_ms))
+        return int(round(start + max(0.0, min(1.0, ratio)) * (end - start)))
 
     def _ms_to_x(self, ms: int) -> float:
+        # Not clamped to the track: callers clip off-view items themselves so
+        # that, when zoomed in, partly-visible bands stay correctly placed.
         track = self._track_rect()
-        if self._duration_ms <= 0:
+        start, end = self._view_span()
+        if end <= start:
             return track.left()
-        ratio = max(0.0, min(1.0, ms / self._duration_ms))
+        ratio = (ms - start) / (end - start)
         return track.left() + ratio * track.width()
+
+    def _reset_view(self) -> None:
+        self._view_start_ms = 0
+        self._view_end_ms = self._duration_ms
+
+    def _set_view(self, start: float, end: float) -> None:
+        """Set the visible window, clamped to the clip and the minimum zoom."""
+        if self._duration_ms <= 0:
+            return
+        span = max(self._MIN_VIEW_MS, min(self._duration_ms, end - start))
+        start = max(0.0, min(start, self._duration_ms - span))
+        self._view_start_ms = int(round(start))
+        self._view_end_ms = int(round(start + span))
+        self.update()
+
+    def _pan_to(self, x: float) -> None:
+        track = self._track_rect()
+        if track.width() <= 0:
+            return
+        start0, end0 = self._pan_anchor_view
+        span = end0 - start0
+        delta_ms = (x - self._pan_anchor_x) * span / track.width()
+        new_start = start0 - delta_ms
+        self._set_view(new_start, new_start + span)
 
     # ---- painting ---------------------------------------------------------
 
@@ -352,10 +408,14 @@ class TimelineSeekBar(QWidget):
                 painter.setBrush(self._PLAYED_COLOR)
                 painter.drawRoundedRect(played, radius, radius)
 
-        # Motion-event bands.
+        # Motion-event bands (clipped to the visible window when zoomed in).
         for event in self._events:
             left = self._ms_to_x(event.start_ms)
             right = self._ms_to_x(event.end_ms)
+            if right < track.left() or left > track.right():
+                continue
+            left = max(left, track.left())
+            right = min(right, track.right())
             band = QRectF(left, track.top(), max(2.0, right - left), track.height())
             is_hi = event.index == self._highlighted
             painter.setBrush(self._EVENT_HILITE_COLOR if is_hi else self._EVENT_COLOR)
@@ -370,13 +430,17 @@ class TimelineSeekBar(QWidget):
         if self._duration_ms > 0:
             self._paint_ticks(painter, track)
 
-        # Playhead, extended down through the ruler.
+        # Playhead, extended down through the ruler (hidden when off the
+        # zoomed-in window).
         if self._duration_ms > 0:
             x = self._ms_to_x(self._position_ms)
-            painter.setPen(self._PLAYHEAD_COLOR)
-            painter.setBrush(self._PLAYHEAD_COLOR)
-            bottom = track.bottom() + 3 + self._TICK_LEN["day"]
-            painter.drawRect(QRectF(x - 1.0, track.top() - 4, 2.0, bottom - (track.top() - 4)))
+            if track.left() - 1 <= x <= track.right() + 1:
+                painter.setPen(self._PLAYHEAD_COLOR)
+                painter.setBrush(self._PLAYHEAD_COLOR)
+                bottom = track.bottom() + 3 + self._TICK_LEN["day"]
+                painter.drawRect(
+                    QRectF(x - 1.0, track.top() - 4, 2.0, bottom - (track.top() - 4))
+                )
 
     def _paint_coverage(self, painter: QPainter, track: QRectF) -> None:
         """Draw a thin line over the track wherever footage exists (global mode)."""
@@ -389,6 +453,10 @@ class TimelineSeekBar(QWidget):
         for start_ms, end_ms in self._coverage:
             x0 = self._ms_to_x(start_ms)
             x1 = self._ms_to_x(end_ms)
+            if x1 < track.left() or x0 > track.right():
+                continue
+            x0 = max(x0, track.left())
+            x1 = min(x1, track.right())
             painter.drawRect(QRectF(x0, cy - height / 2, max(2.0, x1 - x0), height))
 
     def _paint_range(self, painter: QPainter, track: QRectF) -> None:
@@ -485,7 +553,11 @@ class TimelineSeekBar(QWidget):
         duration = self._duration_ms
         if duration <= 0 or track.width() <= 0:
             return []
-        px_per_ms = track.width() / duration
+        view_start, view_end = self._view_span()
+        span = view_end - view_start
+        if span <= 0:
+            return []
+        px_per_ms = track.width() / span
         visible = {
             name for name in self._TICK_LEVELS
             if self._TICK_INTERVAL[name] * px_per_ms >= self._TICK_MIN_PX[name]
@@ -498,7 +570,7 @@ class TimelineSeekBar(QWidget):
 
         ticks: list[dict] = []
         for offset, wall, align in self._boundaries(finest):
-            if offset <= 0 or offset >= duration:  # the edges carry the handles
+            if offset <= view_start or offset >= view_end:  # outside the window
                 continue
             level = self._classify(align)
             if level not in visible:
@@ -715,9 +787,18 @@ class TimelineSeekBar(QWidget):
         self._emit_range()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
+        pos = event.position()
+        # Right-drag pans the zoomed-in day timeline (left-drag still seeks).
+        if event.button() == Qt.MouseButton.RightButton:
+            if self._global:
+                self._panning = True
+                self._pan_anchor_x = pos.x()
+                self._pan_anchor_view = self._view_span()
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+                self._hover_label.setVisible(False)
+            return
         if event.button() != Qt.MouseButton.LeftButton:
             return
-        pos = event.position()
         handle = self._handle_at(pos.x(), pos.y())
         if handle is not None:
             self._drag = handle
@@ -728,6 +809,9 @@ class TimelineSeekBar(QWidget):
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         pos = event.position()
+        if self._panning:
+            self._pan_to(pos.x())
+            return
         if self._drag is not None:
             self._move_handle(self._drag, pos.x())
             self._hover_label.setVisible(False)
@@ -744,6 +828,10 @@ class TimelineSeekBar(QWidget):
             self._show_hover(pos.x())
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if self._panning:
+            self._panning = False
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+            return
         if self._drag is not None:
             which = self._drag
             self._drag = None
@@ -751,6 +839,25 @@ class TimelineSeekBar(QWidget):
             editor = self._editor(which)
             editor.setFocus(Qt.FocusReason.MouseFocusReason)
             editor.selectAll()
+
+    def wheelEvent(self, event) -> None:  # noqa: N802 (Qt naming)
+        # The day timeline zooms around the cursor; file mode scrolls normally.
+        if not self._global or self._duration_ms <= 0:
+            super().wheelEvent(event)
+            return
+        delta = event.angleDelta().y()
+        if delta == 0:
+            return
+        cursor_ms = self._x_to_ms(event.position().x())
+        start, end = self._view_span()
+        span = end - start
+        factor = 1 / 1.25 if delta > 0 else 1.25  # wheel up zooms in
+        new_span = max(self._MIN_VIEW_MS, min(self._duration_ms, span * factor))
+        frac = (cursor_ms - start) / span if span > 0 else 0.5
+        new_start = cursor_ms - frac * new_span
+        self._set_view(new_start, new_start + new_span)
+        self._show_hover(event.position().x())
+        event.accept()
 
     def leaveEvent(self, event) -> None:  # noqa: N802 (Qt naming)
         self._hover_label.setVisible(False)
