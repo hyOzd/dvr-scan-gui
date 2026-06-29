@@ -143,6 +143,9 @@ class MainWindow(QMainWindow):
         # The selected day's footage as (path, day_start_ms, day_end_ms) spans,
         # sorted by start (earlier start wins on overlap).
         self._segments: list[tuple[str, int, int]] = []
+        # Guards the two file lists against re-entrant selection signals while
+        # we mirror/clear selection between them (they act as one selection).
+        self._syncing_selection = False
         self._events: list[MotionEvent] = []  # events of the selected file
         # Real recording start of the selected file (None when its metadata
         # has no usable timestamp); drives the real-time/file-time display.
@@ -255,12 +258,17 @@ class MainWindow(QMainWindow):
 
         self.file_list = FileListWidget()
         self.file_list.filesDropped.connect(self._add_files)
-        self.file_list.currentItemChanged.connect(self._on_current_changed)
+        self.file_list.currentItemChanged.connect(
+            lambda *_: self._on_selection_changed(self.file_list)
+        )
         layout.addWidget(self.file_list, 1)
 
-        # Files with no usable clock time live here in global mode; the user can
-        # double-click one to type a time, which moves it into the main list.
-        self.unknown_header = QLabel("Time unknown — double-click to set a clock time")
+        # Files with no usable clock time live here in global mode. They behave
+        # like any other file (select to play, scan, remove); double-clicking
+        # one lets the user type a clock time, which moves it into the main list.
+        self.unknown_header = QLabel(
+            "Time unknown — double-click to set a clock time"
+        )
         self.unknown_header.setStyleSheet("color: #d98a2b; font-size: 11px;")
         self.unknown_header.setWordWrap(True)
         self.unknown_header.setVisible(False)
@@ -269,6 +277,9 @@ class MainWindow(QMainWindow):
         self.unknown_list = QListWidget()
         self.unknown_list.setMaximumHeight(140)
         self.unknown_list.setVisible(False)
+        self.unknown_list.currentItemChanged.connect(
+            lambda *_: self._on_selection_changed(self.unknown_list)
+        )
         self.unknown_list.itemDoubleClicked.connect(self._on_unknown_activated)
         layout.addWidget(self.unknown_list)
 
@@ -650,7 +661,9 @@ class MainWindow(QMainWindow):
         rest in the 'time unknown' list. The current selection is preserved
         without reloading the player (signals are blocked)."""
         selected = self._current_path
+        self._syncing_selection = True
         self.file_list.blockSignals(True)
+        self.unknown_list.blockSignals(True)
         self.file_list.clear()
         self.unknown_list.clear()
         self._items = {}
@@ -666,43 +679,31 @@ class MainWindow(QMainWindow):
         for path in known:
             self._add_list_item(self.file_list, path)
         for path in unknown:
-            item = QListWidgetItem(self._entries[path].name)
-            item.setData(PATH_ROLE, path)
-            item.setToolTip("Double-click to set this file's clock time.")
-            self.unknown_list.addItem(item)
+            self._add_list_item(self.unknown_list, path)
 
         self.unknown_header.setVisible(self._global_mode and bool(unknown))
         self.unknown_list.setVisible(self._global_mode and bool(unknown))
 
+        # Restore the selection on whichever list now holds the file.
         if selected is not None and selected in self._items:
-            self.file_list.setCurrentItem(self._items[selected])
-        self.file_list.blockSignals(False)
+            item = self._items[selected]
+            item.listWidget().setCurrentItem(item)
 
-        if selected is not None and selected not in self._items:
-            for i in range(self.unknown_list.count()):
-                if self.unknown_list.item(i).data(PATH_ROLE) == selected:
-                    self.unknown_list.setCurrentRow(i)
-                    break
+        self.file_list.blockSignals(False)
+        self.unknown_list.blockSignals(False)
+        self._syncing_selection = False
         self._refresh_playing_indicator()
 
     def _remove_selected(self) -> None:
-        item = self.file_list.currentItem()
-        if item is None:
+        # Works for the file in either list — whichever is currently selected.
+        path = self._current_path
+        if path is None:
             return
-        path = item.data(PATH_ROLE)
         self._order = [p for p in self._order if p != path]
         self._entries.pop(path, None)
-        if self._global_mode:
-            self._items.pop(path, None)
-            if self._current_path == path:
-                self._current_path = None
-                self.player.setSource(QUrl())
-            self._rebuild_lists()
-            self._refresh_timeline_mode()
-        else:
-            self.file_list.takeItem(self.file_list.row(item))
-            self._items.pop(path, None)
-            # currentItemChanged fires from takeItem and re-syncs the player.
+        self._items.pop(path, None)
+        self._clear_selection()  # stops playback, resets the timeline/buttons
+        self._rebuild_lists()    # repopulate without the removed file
         self._update_scan_buttons()
         self._update_day_buttons()
 
@@ -711,7 +712,8 @@ class MainWindow(QMainWindow):
         entry = self._entries.get(path)
         if item is None or entry is None:
             return
-        widget = self.file_list.itemWidget(item)
+        list_widget = item.listWidget()
+        widget = list_widget.itemWidget(item) if list_widget is not None else None
         if widget is None:
             return
         widget.update_view(entry, self._needs_update(entry))
@@ -723,39 +725,59 @@ class MainWindow(QMainWindow):
 
     # ---- file selection / playback ---------------------------------------
 
-    def _on_current_changed(
-        self, current: QListWidgetItem | None, previous: QListWidgetItem | None
-    ) -> None:
-        if previous is not None:
-            self._save_regions(previous.data(PATH_ROLE))
+    def _on_selection_changed(self, which) -> None:
+        """A selection changed in one of the two file lists.
 
-        if current is None:
-            self._current_path = None
-            self._pending_load = False
-            self._post_play_seek_ms = None
-            self._post_play_pause = False
-            self.player.setSource(QUrl())
-            self.video_view.set_regions([])
-            self._recording_start = None
-            self.time_mode_button.setEnabled(False)
-            self.time_mode_button.setToolTip(
-                "No recording timestamp in this file's metadata."
-            )
-            self._show_events([])
-            self.remove_button.setEnabled(False)
-            self.remove_action.setEnabled(False)
-            self.prev_event_button.setEnabled(False)
-            self.next_event_button.setEnabled(False)
-            if self._global_mode:
-                # Keep the day timeline up even with nothing loaded.
-                self._refresh_timeline_mode()
-            else:
-                self.timeline.set_range(None, None)
-                self.timeline.set_start_datetime(None)
-            self._update_scan_buttons()
+        The clock-bearing list and the time-unknown list act as a single
+        selection: choosing a file in one clears the other, so exactly one file
+        is ever current — and a time-unknown file loads, plays and scans just
+        like any other (showing its own file timeline)."""
+        if self._syncing_selection:
             return
+        item = which.currentItem()
+        other = self.unknown_list if which is self.file_list else self.file_list
+        if item is None:
+            # Only a genuine clear when neither list has a selection (otherwise
+            # this is the sibling list being cleared as we switch between them).
+            if other.currentItem() is None:
+                self._clear_selection()
+            return
+        if other.currentItem() is not None:
+            self._syncing_selection = True
+            other.setCurrentItem(None)
+            self._syncing_selection = False
+        path = item.data(PATH_ROLE)
+        if path == self._current_path:
+            return
+        if self._current_path is not None:
+            self._save_regions(self._current_path)
+        self._select_file(path)
 
-        self._select_file(current.data(PATH_ROLE))
+    def _clear_selection(self) -> None:
+        self._current_path = None
+        self._pending_load = False
+        self._post_play_seek_ms = None
+        self._post_play_pause = False
+        self.player.setSource(QUrl())
+        self.video_view.set_regions([])
+        self._recording_start = None
+        self.time_mode_button.setEnabled(False)
+        self.time_mode_button.setToolTip(
+            "No recording timestamp in this file's metadata."
+        )
+        self._show_events([])
+        self.remove_button.setEnabled(False)
+        self.remove_action.setEnabled(False)
+        self.prev_event_button.setEnabled(False)
+        self.next_event_button.setEnabled(False)
+        if self._global_mode:
+            # Keep the day timeline up even with nothing loaded.
+            self._refresh_timeline_mode()
+        else:
+            self.timeline.set_range(None, None)
+            self.timeline.set_start_datetime(None)
+            self.timeline.set_duration(0)
+        self._update_scan_buttons()
 
     def _select_file(self, path: str) -> None:
         entry = self._entries.get(path)
@@ -983,7 +1005,7 @@ class MainWindow(QMainWindow):
         self.region_enabled_check.setEnabled(not active)
         for button in self._tool_buttons.values():
             button.setEnabled(not active)
-        has_selection = self.file_list.currentItem() is not None
+        has_selection = self._current_path is not None
         self.remove_button.setEnabled(not active and has_selection)
         self.remove_action.setEnabled(not active and has_selection)
         self._update_scan_buttons()
@@ -1667,7 +1689,7 @@ class MainWindow(QMainWindow):
         item = self._items.get(path)
         if item is None:
             return
-        # Selecting the row loads the file via _on_current_changed; then we
+        # Selecting the row loads the file via _on_selection_changed; then we
         # override the paused first-frame preview with our target + play state.
         self.file_list.setCurrentItem(item)
         self._pending_load = True
@@ -1689,7 +1711,8 @@ class MainWindow(QMainWindow):
     def _refresh_playing_indicator(self) -> None:
         """Mark the row whose file is currently loaded (global mode only)."""
         for path, item in self._items.items():
-            widget = self.file_list.itemWidget(item)
+            list_widget = item.listWidget()
+            widget = list_widget.itemWidget(item) if list_widget is not None else None
             if isinstance(widget, FileItemWidget):
                 widget.set_playing(self._global_active and path == self._current_path)
 
