@@ -76,12 +76,28 @@ def _draw_clock(p: QPainter, color: QColor) -> None:
     p.drawLine(QPointF(16, 17), QPointF(21, 19))        # hour hand
 
 
+def _draw_calendar(p: QPainter, color: QColor) -> None:
+    pen = QPen(color, 2.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
+               Qt.PenJoinStyle.RoundJoin)
+    p.setPen(pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.drawRoundedRect(QRectF(6, 8, 20, 18), 2.5, 2.5)   # body
+    p.drawLine(QPointF(6, 13), QPointF(26, 13))         # header rule
+    p.drawLine(QPointF(11, 5), QPointF(11, 10))         # left binding
+    p.drawLine(QPointF(21, 5), QPointF(21, 10))         # right binding
+    p.setPen(QPen(color, 2.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+    for cx in (11, 16, 21):                             # day dots
+        for cy in (18, 22):
+            p.drawPoint(QPointF(cx, cy))
+
+
 _DRAWERS = {
     "pointer": _draw_pointer,
     "rectangle": _draw_rectangle,
     "polygon": _draw_polygon,
     "delete": _draw_delete,
     "clock": _draw_clock,
+    "calendar": _draw_calendar,
 }
 
 

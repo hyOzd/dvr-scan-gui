@@ -8,6 +8,7 @@ import unittest
 from dvr_scan_gui.scanner import (
     ScanManager,
     ScanOptions,
+    _parse_duration,
     ms_to_timecode,
     parse_events,
     timecode_to_ms,
@@ -18,6 +19,25 @@ class TimecodeTests(unittest.TestCase):
     def test_roundtrip(self):
         for ms in (0, 533, 5067, 3_661_234):
             self.assertEqual(timecode_to_ms(ms_to_timecode(ms)), ms)
+
+
+class DurationParseTests(unittest.TestCase):
+    def test_seconds_with_unit(self):
+        self.assertEqual(_parse_duration("14.72 s"), 14_720)
+        self.assertEqual(_parse_duration("0.50 s"), 500)
+
+    def test_clock_form(self):
+        self.assertEqual(_parse_duration("0:00:14"), 14_000)
+        self.assertEqual(_parse_duration("1:02:03"), 3_723_000)
+        self.assertEqual(_parse_duration("02:30"), 150_000)
+
+    def test_bare_seconds(self):
+        self.assertEqual(_parse_duration("14.72"), 14_720)
+
+    def test_unparseable_or_missing(self):
+        self.assertIsNone(_parse_duration(None))
+        self.assertIsNone(_parse_duration(""))
+        self.assertIsNone(_parse_duration("n/a"))
 
     def test_parse_known_timecodes(self):
         self.assertEqual(timecode_to_ms("00:00:00.533"), 533)

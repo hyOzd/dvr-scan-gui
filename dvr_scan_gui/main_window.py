@@ -4,19 +4,26 @@ from __future__ import annotations
 
 import os
 import time
+from datetime import date, datetime, timedelta
 
-from PySide6.QtCore import QSize, QStandardPaths, Qt, QUrl
-from PySide6.QtGui import QAction, QKeySequence, QPalette
+from PySide6.QtCore import QDate, QDateTime, QSize, QStandardPaths, Qt, QTime, QUrl
+from PySide6.QtGui import QAction, QColor, QFont, QKeySequence, QPalette, QTextCharFormat
 from PySide6.QtMultimedia import QAudioOutput, QMediaMetaData, QMediaPlayer
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
+    QCalendarWidget,
     QCheckBox,
+    QDateTimeEdit,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
+    QFrame,
     QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QListWidget,
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
@@ -52,7 +59,7 @@ from .scanner import (
     ScanManager,
     ms_to_realtime,
     ms_to_timecode,
-    read_recording_start,
+    read_recording_info,
 )
 from .timeline import TimelineSeekBar
 from .video_view import (
@@ -72,6 +79,44 @@ _VIDEO_FILTER = (
 # event further back each time (instead of re-snapping to the current event).
 _PREV_CHAIN_SECONDS = 2.0
 
+# The global timeline spans one whole day, measured in milliseconds.
+_MS_PER_DAY = 86_400_000
+# Files whose footage overlaps by more than this are flagged (we still just
+# play the earlier-starting one); brief overlaps are common and ignored.
+_OVERLAP_WARN_MS = 5_000
+
+
+def compute_day_segments(
+    entries: list[FileEntry], day: date
+) -> tuple[list[tuple[str, int, int]], int]:
+    """Footage spans intersecting ``day`` as ``(path, day_start_ms, day_end_ms)``.
+
+    Spans are clipped to the day, sorted by start (so the earlier clip wins on
+    overlap), and returned with a count of consecutive overlaps longer than
+    :data:`_OVERLAP_WARN_MS`. Files with no clock start are skipped; a file with
+    a clock start but unknown duration contributes a zero-width span.
+    """
+    midnight = datetime(day.year, day.month, day.day)
+    day_end = midnight + timedelta(days=1)
+    raw: list[tuple[str, int, int]] = []
+    for entry in entries:
+        start = entry.clock_start
+        if start is None:
+            continue
+        end = entry.clock_end or start
+        if end < midnight or start >= day_end:
+            continue
+        start_ms = int(round((max(start, midnight) - midnight).total_seconds() * 1000))
+        end_ms = int(round((min(end, day_end) - midnight).total_seconds() * 1000))
+        raw.append((entry.path, start_ms, max(start_ms, end_ms)))
+    raw.sort(key=lambda seg: seg[1])
+    overlaps = sum(
+        1
+        for i in range(1, len(raw))
+        if raw[i - 1][2] - raw[i][1] > _OVERLAP_WARN_MS
+    )
+    return raw, overlaps
+
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
@@ -82,7 +127,22 @@ class MainWindow(QMainWindow):
         # Per-file state.
         self._entries: dict[str, FileEntry] = {}
         self._items: dict[str, QListWidgetItem] = {}
+        # Stable add-order of all files; the two list widgets are rebuilt from
+        # this (and from each entry's clock time) as the mode changes.
+        self._order: list[str] = []
         self._current_path: str | None = None
+
+        # Global timeline mode: browse a whole day across all files instead of
+        # one file at a time. ``_global_active`` is the *effective* state — on
+        # only when the mode is enabled, a day is chosen, and the current file
+        # is reachable (has a clock time); a clock-less selection falls back to
+        # that file's own timeline.
+        self._global_mode = False
+        self._global_active = False
+        self._selected_day: date | None = None
+        # The selected day's footage as (path, day_start_ms, day_end_ms) spans,
+        # sorted by start (earlier start wins on overlap).
+        self._segments: list[tuple[str, int, int]] = []
         self._events: list[MotionEvent] = []  # events of the selected file
         # Real recording start of the selected file (None when its metadata
         # has no usable timestamp); drives the real-time/file-time display.
@@ -197,6 +257,20 @@ class MainWindow(QMainWindow):
         self.file_list.filesDropped.connect(self._add_files)
         self.file_list.currentItemChanged.connect(self._on_current_changed)
         layout.addWidget(self.file_list, 1)
+
+        # Files with no usable clock time live here in global mode; the user can
+        # double-click one to type a time, which moves it into the main list.
+        self.unknown_header = QLabel("Time unknown — double-click to set a clock time")
+        self.unknown_header.setStyleSheet("color: #d98a2b; font-size: 11px;")
+        self.unknown_header.setWordWrap(True)
+        self.unknown_header.setVisible(False)
+        layout.addWidget(self.unknown_header)
+
+        self.unknown_list = QListWidget()
+        self.unknown_list.setMaximumHeight(140)
+        self.unknown_list.setVisible(False)
+        self.unknown_list.itemDoubleClicked.connect(self._on_unknown_activated)
+        layout.addWidget(self.unknown_list)
 
         hint = QLabel("Drag video files here to add them.")
         hint.setStyleSheet("color: gray; font-size: 11px;")
@@ -341,6 +415,49 @@ class MainWindow(QMainWindow):
         controls.setColumnStretch(1, 0)
         controls.setColumnStretch(2, 1)
 
+        # Bottom-left: the global-timeline toggle and (once enabled) the day
+        # picker plus prev/next-day jumps.
+        left_controls = QHBoxLayout()
+        left_controls.setContentsMargins(0, 0, 0, 0)
+        button_text = self.palette().color(QPalette.ColorRole.ButtonText)
+
+        self.global_toggle_button = QPushButton()
+        self.global_toggle_button.setIcon(tool_icon("calendar", button_text))
+        self.global_toggle_button.setIconSize(QSize(18, 18))
+        self.global_toggle_button.setCheckable(True)
+        self.global_toggle_button.setToolTip(
+            "Global timeline — browse a whole day across every file."
+        )
+        self.global_toggle_button.toggled.connect(self._on_global_toggled)
+        left_controls.addWidget(self.global_toggle_button)
+
+        self.prev_day_button = QPushButton("◀")
+        self.prev_day_button.setFixedWidth(28)
+        self.prev_day_button.setToolTip("Previous day with footage.")
+        self.prev_day_button.clicked.connect(lambda: self._step_day(-1))
+        left_controls.addWidget(self.prev_day_button)
+
+        self.calendar_button = QPushButton("—")
+        self.calendar_button.setToolTip("Pick a day.")
+        self.calendar_button.clicked.connect(self._open_calendar)
+        left_controls.addWidget(self.calendar_button)
+
+        self.next_day_button = QPushButton("▶")
+        self.next_day_button.setFixedWidth(28)
+        self.next_day_button.setToolTip("Next day with footage.")
+        self.next_day_button.clicked.connect(lambda: self._step_day(+1))
+        left_controls.addWidget(self.next_day_button)
+
+        self._day_widgets = [
+            self.prev_day_button, self.calendar_button, self.next_day_button,
+        ]
+        for widget in self._day_widgets:
+            widget.setVisible(False)
+        controls.addLayout(
+            left_controls, 0, 0,
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+        )
+
         transport = QHBoxLayout()
         transport.setContentsMargins(0, 0, 0, 0)
         self.prev_event_button = QPushButton()
@@ -454,6 +571,13 @@ class MainWindow(QMainWindow):
     # ---- file list management --------------------------------------------
 
     def _ordered_paths(self) -> list[str]:
+        # The stable add-order of every file (independent of which list widget
+        # currently shows it), used for scanning.
+        return list(self._order)
+
+    def _shown_paths(self) -> list[str]:
+        # Paths currently shown in the main list, in display order (used for
+        # file-by-file event navigation).
         return [
             self.file_list.item(i).data(PATH_ROLE)
             for i in range(self.file_list.count())
@@ -479,15 +603,8 @@ class MainWindow(QMainWindow):
             if path in self._entries:
                 duplicates.append(path)
                 continue
-            entry = FileEntry(path=path)
-            self._entries[path] = entry
-            item = QListWidgetItem()
-            item.setData(PATH_ROLE, path)
-            self.file_list.addItem(item)
-            widget = FileItemWidget()
-            self.file_list.setItemWidget(item, widget)
-            self._items[path] = item
-            self._refresh_row(path)
+            self._entries[path] = FileEntry(path=path)
+            self._order.append(path)
             added.append(path)
 
         if duplicates:
@@ -498,20 +615,96 @@ class MainWindow(QMainWindow):
                 f"These file(s) are already in the list:\n\n{names}",
             )
 
-        if added and self.file_list.currentItem() is None:
-            self.file_list.setCurrentItem(self._items[added[0]])
+        if self._global_mode:
+            for path in added:
+                self._ensure_probed(self._entries[path])
+            self._ensure_day_selected()
+            self._rebuild_lists()
+            self._refresh_timeline_mode()
+        else:
+            for path in added:
+                self._add_list_item(self.file_list, path)
+
+        if added and self.file_list.currentItem() is None and self.file_list.count():
+            self.file_list.setCurrentItem(self.file_list.item(0))
         self._update_scan_buttons()
+        self._update_day_buttons()
+
+    def _add_list_item(self, list_widget: QListWidget, path: str) -> None:
+        """Create the rich row widget for ``path`` in ``list_widget``."""
+        item = QListWidgetItem()
+        item.setData(PATH_ROLE, path)
+        list_widget.addItem(item)
+        widget = FileItemWidget()
+        list_widget.setItemWidget(item, widget)
+        self._items[path] = item
+        self._refresh_row(path)
+
+    # ---- list (re)building -------------------------------------------------
+
+    def _rebuild_lists(self) -> None:
+        """Repopulate the file lists from ``_entries`` for the current mode.
+
+        Normal mode shows every file in add order in the main list. Global mode
+        shows clock-bearing files sorted by clock time in the main list and the
+        rest in the 'time unknown' list. The current selection is preserved
+        without reloading the player (signals are blocked)."""
+        selected = self._current_path
+        self.file_list.blockSignals(True)
+        self.file_list.clear()
+        self.unknown_list.clear()
+        self._items = {}
+
+        if self._global_mode:
+            known = [p for p in self._order if self._entries[p].clock_start is not None]
+            known.sort(key=lambda p: self._entries[p].clock_start)
+            unknown = [p for p in self._order if self._entries[p].clock_start is None]
+        else:
+            known = list(self._order)
+            unknown = []
+
+        for path in known:
+            self._add_list_item(self.file_list, path)
+        for path in unknown:
+            item = QListWidgetItem(self._entries[path].name)
+            item.setData(PATH_ROLE, path)
+            item.setToolTip("Double-click to set this file's clock time.")
+            self.unknown_list.addItem(item)
+
+        self.unknown_header.setVisible(self._global_mode and bool(unknown))
+        self.unknown_list.setVisible(self._global_mode and bool(unknown))
+
+        if selected is not None and selected in self._items:
+            self.file_list.setCurrentItem(self._items[selected])
+        self.file_list.blockSignals(False)
+
+        if selected is not None and selected not in self._items:
+            for i in range(self.unknown_list.count()):
+                if self.unknown_list.item(i).data(PATH_ROLE) == selected:
+                    self.unknown_list.setCurrentRow(i)
+                    break
+        self._refresh_playing_indicator()
 
     def _remove_selected(self) -> None:
         item = self.file_list.currentItem()
         if item is None:
             return
         path = item.data(PATH_ROLE)
-        self.file_list.takeItem(self.file_list.row(item))
-        self._items.pop(path, None)
+        self._order = [p for p in self._order if p != path]
         self._entries.pop(path, None)
-        # currentItemChanged fires from takeItem and re-syncs the player.
+        if self._global_mode:
+            self._items.pop(path, None)
+            if self._current_path == path:
+                self._current_path = None
+                self.player.setSource(QUrl())
+            self._rebuild_lists()
+            self._refresh_timeline_mode()
+        else:
+            self.file_list.takeItem(self.file_list.row(item))
+            self._items.pop(path, None)
+            # currentItemChanged fires from takeItem and re-syncs the player.
         self._update_scan_buttons()
+        self._update_day_buttons()
 
     def _refresh_row(self, path: str) -> None:
         item = self._items.get(path)
@@ -543,9 +736,7 @@ class MainWindow(QMainWindow):
             self._post_play_pause = False
             self.player.setSource(QUrl())
             self.video_view.set_regions([])
-            self.timeline.set_range(None, None)
             self._recording_start = None
-            self.timeline.set_start_datetime(None)
             self.time_mode_button.setEnabled(False)
             self.time_mode_button.setToolTip(
                 "No recording timestamp in this file's metadata."
@@ -555,6 +746,12 @@ class MainWindow(QMainWindow):
             self.remove_action.setEnabled(False)
             self.prev_event_button.setEnabled(False)
             self.next_event_button.setEnabled(False)
+            if self._global_mode:
+                # Keep the day timeline up even with nothing loaded.
+                self._refresh_timeline_mode()
+            else:
+                self.timeline.set_range(None, None)
+                self.timeline.set_start_datetime(None)
             self._update_scan_buttons()
             return
 
@@ -588,18 +785,29 @@ class MainWindow(QMainWindow):
         self.next_event_button.setEnabled(True)
         self._set_status(f"Loaded {entry.name}")
         self._update_scan_buttons()
+        # Decide whether this selection keeps the day timeline (clock-bearing)
+        # or drops to this file's own timeline (clock-less).
+        self._refresh_timeline_mode()
+
+    def _ensure_probed(self, entry: FileEntry) -> None:
+        """Read this file's recording start and duration once (via exiftool)."""
+        if entry.start_probed:
+            return
+        entry.recording_start, entry.duration_ms = read_recording_info(entry.path)
+        entry.start_probed = True
 
     def _apply_recording_start(self, entry: FileEntry) -> None:
         """Probe (once) and apply the file's real recording start, wiring up the
-        real-time toggle for the seek bar and time read-outs."""
-        if not entry.start_probed:
-            entry.recording_start = read_recording_start(entry.path)
-            entry.start_probed = True
+        real-time toggle for the seek bar and time read-outs.
+
+        While the day timeline is active the seek bar is driven by the global
+        view, so the per-file start/time-mode are not pushed to it here."""
+        self._ensure_probed(entry)
         self._recording_start = entry.recording_start
-        self.timeline.set_start_datetime(entry.recording_start)
 
         has_start = entry.recording_start is not None
-        self.time_mode_button.setEnabled(has_start)
+        # The file/real toggle only applies to a file's own timeline.
+        self.time_mode_button.setEnabled(has_start and not self._global_active)
         if has_start:
             self.time_mode_button.setToolTip(
                 f"Recording started {ms_to_realtime(entry.recording_start, 0)}.\n"
@@ -611,8 +819,12 @@ class MainWindow(QMainWindow):
             )
         # Default to real recording time whenever the file provides it; fall
         # back to file time otherwise. The user can still toggle afterward.
+        self.time_mode_button.blockSignals(True)
         self.time_mode_button.setChecked(has_start)
-        self.timeline.set_time_mode(has_start)
+        self.time_mode_button.blockSignals(False)
+        if not self._global_active:
+            self.timeline.set_start_datetime(entry.recording_start)
+            self.timeline.set_time_mode(has_start)
 
     def _apply_regions_for_current(self) -> None:
         entry = self._entries.get(self._current_path)
@@ -632,7 +844,10 @@ class MainWindow(QMainWindow):
     def _show_events(self, events: list[MotionEvent]) -> None:
         self._events = list(events)
         self._populate_results(self._events)
-        self.timeline.set_events(self._events)
+        # In the day view the timeline shows every file's events (set by
+        # _refresh_global_view); here it shows only the current file's.
+        if not self._global_active:
+            self.timeline.set_events(self._events)
 
     # ---- detection region -------------------------------------------------
 
@@ -818,6 +1033,9 @@ class MainWindow(QMainWindow):
             self._refresh_row(path)
             if path == self._current_path:
                 self._show_events(events)
+            if self._global_active:
+                # A newly scanned file contributes events to the day timeline.
+                self._refresh_global_view()
         self._update_total_progress()
 
     def _on_scan_failed(self, path: str, message: str) -> None:
@@ -983,7 +1201,7 @@ class MainWindow(QMainWindow):
             self.results_table.selectRow(row)
 
     def _jump_file(self, direction: int) -> None:
-        paths = self._ordered_paths()
+        paths = self._shown_paths()
         if self._current_path is None or self._current_path not in paths:
             return
         target_index = paths.index(self._current_path) + direction
@@ -1022,11 +1240,23 @@ class MainWindow(QMainWindow):
     def _on_user_seek(self, position_ms: int) -> None:
         # Scrubbing the timeline ends any Previous run.
         self._reset_prev_chain()
-        self._seek(position_ms)
+        if self._global_active:
+            # The day timeline emits a position in day-ms; resolve it to a file.
+            self._goto_day_ms(position_ms)
+        else:
+            self._seek(position_ms)
 
     def _seek(self, position_ms: int) -> None:
         self.player.setPosition(int(position_ms))
-        self.timeline.set_position(int(position_ms))
+        self._set_timeline_position(int(position_ms))
+
+    def _set_timeline_position(self, file_ms: int) -> None:
+        """Place the playhead, mapping a file offset to day-ms when global."""
+        if self._global_active:
+            base = self._file_base_ms(self._current_path) or 0
+            self.timeline.set_position(base + int(file_ms))
+        else:
+            self.timeline.set_position(int(file_ms))
 
     def _toggle_play(self) -> None:
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
@@ -1038,7 +1268,7 @@ class MainWindow(QMainWindow):
         self.audio.setVolume(value / 100.0)
 
     def _on_position_changed(self, position_ms: int) -> None:
-        self.timeline.set_position(position_ms)
+        self._set_timeline_position(position_ms)
         self._update_time_label(position_ms, self.player.duration())
         if self._post_play_seek_ms is not None or self._post_play_pause:
             self._apply_post_play()
@@ -1054,7 +1284,7 @@ class MainWindow(QMainWindow):
             target = self._post_play_seek_ms
             self._post_play_seek_ms = None
             self.player.setPosition(target)
-            self.timeline.set_position(target)
+            self._set_timeline_position(target)
 
     def _on_metadata_changed(self) -> None:
         # Feed the source resolution to the view as soon as it's known, so the
@@ -1066,10 +1296,23 @@ class MainWindow(QMainWindow):
             self._apply_regions_for_current()
 
     def _on_duration_changed(self, duration_ms: int) -> None:
-        self.timeline.set_duration(duration_ms)
-        self._update_time_label(self.player.position(), duration_ms)
-        # Restore this file's saved scan range now that the clip length is known.
-        self._apply_range_for_current()
+        # The player just reported the loaded file's real length; remember it so
+        # the day layout knows this file's clock span (it may not have been in
+        # the metadata), and refresh the day view if that changed anything.
+        entry = self._entries.get(self._current_path)
+        if entry is not None and duration_ms > 0 and entry.duration_ms is None:
+            entry.duration_ms = duration_ms
+            if self._global_active:
+                self._refresh_global_view()
+
+        if self._global_active:
+            self._update_time_label(self.player.position(), duration_ms)
+            self._sync_global_playhead()
+        else:
+            self.timeline.set_duration(duration_ms)
+            self._update_time_label(self.player.position(), duration_ms)
+            # Restore this file's saved scan range now that its length is known.
+            self._apply_range_for_current()
         if duration_ms > 0:
             self._apply_pending_playback()
 
@@ -1079,6 +1322,9 @@ class MainWindow(QMainWindow):
             QMediaPlayer.MediaStatus.BufferedMedia,
         ):
             self._apply_pending_playback()
+        elif status == QMediaPlayer.MediaStatus.EndOfMedia and self._global_active:
+            # Roll straight on to the next clip in the day (skipping any gap).
+            self._advance_segment()
 
     def _on_seekable_changed(self, _seekable: bool) -> None:
         self._apply_pending_playback()
@@ -1112,6 +1358,8 @@ class MainWindow(QMainWindow):
         self.player.play()
 
     def _on_time_mode_toggled(self, real_time: bool) -> None:
+        if self._global_active:
+            return  # the day timeline forces real (wall-clock) time
         self.timeline.set_time_mode(real_time)
         self._update_time_label(self.player.position(), self.player.duration())
 
@@ -1119,6 +1367,13 @@ class MainWindow(QMainWindow):
         return self._recording_start is not None and self.time_mode_button.isChecked()
 
     def _update_time_label(self, position_ms: int, duration_ms: int) -> None:
+        if self._global_active:
+            # The day's wall-clock time at the playhead.
+            midnight = self._midnight()
+            base = self._file_base_ms(self._current_path)
+            if midnight is not None and base is not None:
+                self.time_label.setText(ms_to_realtime(midnight, base + position_ms))
+            return
         if self._real_time_active():
             # Only the current clock time — an "end" wall-clock time alongside it
             # reads ambiguously, so it's omitted in clock mode.
@@ -1136,6 +1391,307 @@ class MainWindow(QMainWindow):
     def _on_player_error(self, _error, error_string: str) -> None:
         if error_string:
             self._set_status(f"Player error: {error_string}")
+
+    # ---- global timeline: mode + day selection ----------------------------
+
+    def _on_global_toggled(self, enabled: bool) -> None:
+        self._global_mode = enabled
+        for widget in self._day_widgets:
+            widget.setVisible(enabled)
+        if enabled:
+            # The day layout needs every file's clock span up front.
+            for entry in self._entries.values():
+                self._ensure_probed(entry)
+            self._ensure_day_selected()
+        self.timeline.set_global_mode(enabled)
+        self._rebuild_lists()
+        self._update_day_buttons()
+        self._refresh_timeline_mode()
+        if not enabled:
+            self._set_status("Global timeline off.")
+
+    def _footage_days(self) -> list[date]:
+        """All distinct calendar days any file's footage touches, sorted."""
+        days: set[date] = set()
+        for entry in self._entries.values():
+            start = entry.clock_start
+            if start is None:
+                continue
+            days.add(start.date())
+            end = entry.clock_end
+            if end is not None:
+                days.add(end.date())
+        return sorted(days)
+
+    def _ensure_day_selected(self) -> None:
+        if self._global_mode and self._selected_day is None:
+            days = self._footage_days()
+            if days:
+                self._selected_day = days[0]
+
+    def _step_day(self, direction: int) -> None:
+        days = self._footage_days()
+        if not days:
+            return
+        if self._selected_day is None:
+            self._set_day(days[0])
+            return
+        if direction > 0:
+            nxt = next((d for d in days if d > self._selected_day), None)
+        else:
+            nxt = next((d for d in reversed(days) if d < self._selected_day), None)
+        if nxt is not None:
+            self._set_day(nxt)
+
+    def _set_day(self, day: date) -> None:
+        self._selected_day = day
+        self._update_day_buttons()
+        self._refresh_timeline_mode()
+
+    def _update_day_buttons(self) -> None:
+        if self._selected_day is not None:
+            self.calendar_button.setText(self._selected_day.strftime("%a %d %b %Y"))
+        else:
+            self.calendar_button.setText("—")
+        days = self._footage_days()
+        day = self._selected_day
+        self.prev_day_button.setEnabled(
+            bool(days) and (day is None or any(d < day for d in days))
+        )
+        self.next_day_button.setEnabled(
+            bool(days) and (day is None or any(d > day for d in days))
+        )
+
+    def _open_calendar(self) -> None:
+        popup = QFrame(self, Qt.WindowType.Popup)
+        popup.setFrameShape(QFrame.Shape.StyledPanel)
+        layout = QVBoxLayout(popup)
+        layout.setContentsMargins(4, 4, 4, 4)
+        calendar = QCalendarWidget(popup)
+        calendar.setGridVisible(True)
+        if self._selected_day is not None:
+            d = self._selected_day
+            calendar.setSelectedDate(QDate(d.year, d.month, d.day))
+        self._highlight_footage_days(calendar)
+        calendar.clicked.connect(
+            lambda qd: (self._set_day(date(qd.year(), qd.month(), qd.day())),
+                        popup.close())
+        )
+        layout.addWidget(calendar)
+        pos = self.calendar_button.mapToGlobal(
+            self.calendar_button.rect().topLeft()
+        )
+        popup.adjustSize()
+        popup.move(pos.x(), pos.y() - popup.height())
+        popup.show()
+
+    def _highlight_footage_days(self, calendar: QCalendarWidget) -> None:
+        fmt = QTextCharFormat()
+        fmt.setFontWeight(QFont.Weight.Bold)
+        fmt.setForeground(QColor("#5a82c8"))
+        for day in self._footage_days():
+            calendar.setDateTextFormat(QDate(day.year, day.month, day.day), fmt)
+
+    def _on_unknown_activated(self, item: QListWidgetItem) -> None:
+        path = item.data(PATH_ROLE)
+        entry = self._entries.get(path)
+        if entry is None:
+            return
+        when = self._ask_clock_time(entry)
+        if when is None:
+            return
+        entry.manual_start = when
+        self._ensure_day_selected()
+        self._rebuild_lists()
+        self._update_day_buttons()
+        self._refresh_timeline_mode()
+
+    def _ask_clock_time(self, entry: FileEntry) -> datetime | None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Clock time — {entry.name}")
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("Enter the real time this recording started:"))
+        edit = QDateTimeEdit()
+        edit.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
+        edit.setCalendarPopup(True)
+        anchor = self._selected_day or date.today()
+        edit.setDateTime(
+            QDateTime(QDate(anchor.year, anchor.month, anchor.day), QTime(0, 0, 0))
+        )
+        layout.addWidget(edit)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        qdt = edit.dateTime()
+        d, t = qdt.date(), qdt.time()
+        return datetime(d.year(), d.month(), d.day(), t.hour(), t.minute(), t.second())
+
+    # ---- global timeline: day geometry + segments -------------------------
+
+    def _midnight(self) -> datetime | None:
+        if self._selected_day is None:
+            return None
+        d = self._selected_day
+        return datetime(d.year, d.month, d.day)
+
+    def _file_base_ms(self, path: str | None) -> int | None:
+        """Offset (ms from the selected day's midnight) of ``path``'s start.
+
+        May be negative for a file that began before midnight."""
+        entry = self._entries.get(path) if path else None
+        midnight = self._midnight()
+        if entry is None or entry.clock_start is None or midnight is None:
+            return None
+        return int(round((entry.clock_start - midnight).total_seconds() * 1000))
+
+    def _compute_segments(
+        self, day: date
+    ) -> tuple[list[tuple[str, int, int]], int]:
+        return compute_day_segments([self._entries[p] for p in self._order], day)
+
+    def _global_events(self, day: date) -> list[MotionEvent]:
+        """Every file's events for ``day``, mapped to day-ms (synthetic index)."""
+        midnight = datetime(day.year, day.month, day.day)
+        out: list[MotionEvent] = []
+        for path in self._order:
+            entry = self._entries[path]
+            if entry.clock_start is None:
+                continue
+            base = int(round((entry.clock_start - midnight).total_seconds() * 1000))
+            for event in entry.events:
+                start = base + event.start_ms
+                end = base + event.end_ms
+                if end < 0 or start > _MS_PER_DAY:
+                    continue
+                out.append(
+                    MotionEvent(len(out) + 1, max(0, start), min(_MS_PER_DAY, end))
+                )
+        return out
+
+    def _refresh_global_view(self) -> None:
+        """Feed the day's coverage and events to the timeline (global mode)."""
+        if not self._global_mode or self._selected_day is None:
+            return
+        day = self._selected_day
+        segments, overlaps = self._compute_segments(day)
+        self._segments = segments
+        self.timeline.set_start_datetime(self._midnight())
+        self.timeline.set_time_mode(True)
+        self.timeline.set_duration(_MS_PER_DAY)
+        self.timeline.set_coverage([(s, e) for (_p, s, e) in segments])
+        self.timeline.set_events(self._global_events(day))
+        if overlaps:
+            self._set_status(
+                f"⚠ {overlaps} overlapping file(s) on {day.isoformat()} "
+                "— playing the earlier one."
+            )
+
+    # ---- global timeline: mode switching + seamless playback --------------
+
+    def _refresh_timeline_mode(self) -> None:
+        """Reconcile the timeline with the current mode and selection."""
+        cur = self._entries.get(self._current_path) if self._current_path else None
+        reachable = cur is None or cur.clock_start is not None
+        self._global_active = (
+            self._global_mode and self._selected_day is not None and reachable
+        )
+        if self._global_active:
+            self.time_mode_button.setEnabled(False)
+            self.timeline.set_global_mode(True)
+            self._refresh_global_view()
+            self._sync_global_playhead()
+        else:
+            self.timeline.set_global_mode(False)
+            if cur is not None:
+                self.time_mode_button.setEnabled(cur.recording_start is not None)
+                self._apply_file_timeline(cur)
+        self._refresh_playing_indicator()
+
+    def _apply_file_timeline(self, entry: FileEntry) -> None:
+        """Render this file's own timeline (used outside the day view)."""
+        self.timeline.set_start_datetime(entry.recording_start)
+        self.timeline.set_time_mode(
+            self.time_mode_button.isChecked() and entry.recording_start is not None
+        )
+        self.timeline.set_duration(self.player.duration())
+        self.timeline.set_events(entry.events)
+        self.timeline.set_range(entry.range_start_ms, entry.range_end_ms)
+        self.timeline.set_position(self.player.position())
+
+    def _current_segment(self) -> tuple[str, int, int] | None:
+        return next((s for s in self._segments if s[0] == self._current_path), None)
+
+    def _sync_global_playhead(self) -> None:
+        base = self._file_base_ms(self._current_path)
+        if base is None:
+            return
+        self.timeline.set_position(base + self.player.position())
+        self._update_time_label(self.player.position(), self.player.duration())
+
+    def _resolve_day_ms(self, day_ms: int) -> tuple[str, int] | None:
+        """Map a day-ms time to (path, file offset), snapping forward on a gap."""
+        for path, start, end in self._segments:
+            if start <= day_ms < end or start == end == day_ms:
+                base = self._file_base_ms(path) or 0
+                return path, max(0, day_ms - base)
+        for path, start, _end in self._segments:  # nearest footage afterwards
+            if start >= day_ms:
+                base = self._file_base_ms(path) or 0
+                return path, max(0, start - base)
+        return None
+
+    def _goto_day_ms(self, day_ms: int) -> None:
+        day_ms = max(0, min(int(day_ms), _MS_PER_DAY))
+        target = self._resolve_day_ms(day_ms)
+        if target is None:
+            self._set_status("No footage at or after that time today.")
+            return
+        path, offset = target
+        was_playing = (
+            self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+        )
+        if path == self._current_path and self.player.duration() > 0:
+            self._seek(offset)
+            if was_playing:
+                self.player.play()
+        else:
+            self._load_for_global(path, offset, was_playing)
+
+    def _load_for_global(self, path: str, offset: int, autoplay: bool) -> None:
+        """Switch to ``path`` (loading it) and seek to ``offset`` when ready."""
+        item = self._items.get(path)
+        if item is None:
+            return
+        # Selecting the row loads the file via _on_current_changed; then we
+        # override the paused first-frame preview with our target + play state.
+        self.file_list.setCurrentItem(item)
+        self._pending_load = True
+        self._pending_seek_ms = int(offset)
+        self._pending_autoplay = autoplay
+
+    def _advance_segment(self) -> None:
+        index = next(
+            (i for i, seg in enumerate(self._segments) if seg[0] == self._current_path),
+            None,
+        )
+        if index is None or index + 1 >= len(self._segments):
+            self._set_status("Reached the end of the day's footage.")
+            return
+        path, start, _end = self._segments[index + 1]
+        base = self._file_base_ms(path) or 0
+        self._load_for_global(path, max(0, start - base), autoplay=True)
+
+    def _refresh_playing_indicator(self) -> None:
+        """Mark the row whose file is currently loaded (global mode only)."""
+        for path, item in self._items.items():
+            widget = self.file_list.itemWidget(item)
+            if isinstance(widget, FileItemWidget):
+                widget.set_playing(self._global_active and path == self._current_path)
 
     # ---- misc -------------------------------------------------------------
 

@@ -121,6 +121,7 @@ class TimelineSeekBar(QWidget):
     _EXCLUDED_COLOR = QColor(18, 18, 22, 165)
     _START_COLOR = QColor(80, 200, 120)
     _END_COLOR = QColor(232, 110, 90)
+    _COVERAGE_COLOR = QColor(120, 170, 235)
 
     _LABEL_H = 18
     _HANDLE_HALF = 7  # px hit radius around a handle
@@ -158,6 +159,11 @@ class TimelineSeekBar(QWidget):
         # shown as wall-clock timestamps (with date) instead of file offsets.
         self._start_dt: datetime | None = None
         self._real_time = False
+        # Global timeline mode: the track spans a whole day (in day-ms) and the
+        # scan-range handles are suppressed; footage is drawn as a thin coverage
+        # line instead of a played fill.
+        self._global = False
+        self._coverage: list[tuple[int, int]] = []
         self.setMinimumHeight(66)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setMouseTracking(True)
@@ -263,6 +269,22 @@ class TimelineSeekBar(QWidget):
             self._reposition_editors()
         self.update()
 
+    def set_global_mode(self, enabled: bool) -> None:
+        """Toggle the aggregate day timeline (no per-file scan-range handles)."""
+        enabled = bool(enabled)
+        if enabled == self._global:
+            return
+        self._global = enabled
+        if enabled:
+            self._drag = None
+            self._set_active(None)  # tuck away the range editors
+        self.update()
+
+    def set_coverage(self, segments: list[tuple[int, int]]) -> None:
+        """Set the day-ms spans where footage exists (global mode only)."""
+        self._coverage = [(int(a), int(b)) for a, b in segments]
+        self.update()
+
     def _use_real(self) -> bool:
         return self._real_time and self._start_dt is not None
 
@@ -320,12 +342,15 @@ class TimelineSeekBar(QWidget):
         painter.setBrush(self._TRACK_COLOR)
         painter.drawRoundedRect(track, radius, radius)
 
-        # Played portion.
+        # Played portion (file mode) or the thin footage-coverage line (global).
         if self._duration_ms > 0:
-            played = QRectF(track)
-            played.setRight(self._ms_to_x(self._position_ms))
-            painter.setBrush(self._PLAYED_COLOR)
-            painter.drawRoundedRect(played, radius, radius)
+            if self._global:
+                self._paint_coverage(painter, track)
+            else:
+                played = QRectF(track)
+                played.setRight(self._ms_to_x(self._position_ms))
+                painter.setBrush(self._PLAYED_COLOR)
+                painter.drawRoundedRect(played, radius, radius)
 
         # Motion-event bands.
         for event in self._events:
@@ -337,7 +362,8 @@ class TimelineSeekBar(QWidget):
             painter.drawRoundedRect(band, 2.0, 2.0)
 
         # Dim everything outside the selected scan range, plus the handles.
-        if self._duration_ms > 0:
+        # (The aggregate day timeline has no per-file scan range.)
+        if self._duration_ms > 0 and not self._global:
             self._paint_range(painter, track)
 
         # Timeline ruler (multi-level ticks + labels) beneath the track.
@@ -351,6 +377,19 @@ class TimelineSeekBar(QWidget):
             painter.setBrush(self._PLAYHEAD_COLOR)
             bottom = track.bottom() + 3 + self._TICK_LEN["day"]
             painter.drawRect(QRectF(x - 1.0, track.top() - 4, 2.0, bottom - (track.top() - 4)))
+
+    def _paint_coverage(self, painter: QPainter, track: QRectF) -> None:
+        """Draw a thin line over the track wherever footage exists (global mode)."""
+        if not self._coverage:
+            return
+        height = 3.0
+        cy = track.center().y()
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(self._COVERAGE_COLOR)
+        for start_ms, end_ms in self._coverage:
+            x0 = self._ms_to_x(start_ms)
+            x1 = self._ms_to_x(end_ms)
+            painter.drawRect(QRectF(x0, cy - height / 2, max(2.0, x1 - x0), height))
 
     def _paint_range(self, painter: QPainter, track: QRectF) -> None:
         start_x = self._ms_to_x(self._eff_start())
@@ -651,7 +690,7 @@ class TimelineSeekBar(QWidget):
             self.seekRequested.emit(self._x_to_ms(x))
 
     def _handle_at(self, x: float, y: float) -> str | None:
-        if self._duration_ms <= 0:
+        if self._duration_ms <= 0 or self._global:
             return None
         track = self._track_rect()
         if not (track.top() - 8 <= y <= track.bottom() + 8):

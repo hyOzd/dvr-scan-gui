@@ -17,6 +17,7 @@ suppresses the progress bar, leaving the progress widget stuck until the end.
 
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import subprocess
@@ -66,37 +67,84 @@ def ms_to_timecode(ms: int) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{ms:03d}"
 
 
-def read_recording_start(path: str) -> datetime | None:
-    """Return the real wall-clock time the recording started, or ``None``.
+def read_recording_info(path: str) -> tuple[datetime | None, int | None]:
+    """Return ``(recording_start, duration_ms)`` for a video, either ``None``.
 
-    Reads the video's *Media Create Date* metadata via ``exiftool``. QuickTime
-    / MP4 create-date tags are stored in UTC, so ``-api QuickTimeUTC=1`` is
-    used to convert the value to local time, giving the actual moment the clip
-    began. Returns ``None`` when exiftool is missing, the tag is absent, or the
-    tag holds the QuickTime zero-date sentinel (1904).
+    Reads the *Media Create Date* and *Duration* metadata in a single
+    ``exiftool`` call. QuickTime / MP4 create-date tags are stored in UTC, so
+    ``-api QuickTimeUTC=1`` converts the value to local time, giving the actual
+    moment the clip began. JSON output (``-j``) is used so the two tags can be
+    told apart by name even when one is absent. The start is ``None`` when
+    exiftool is missing, the tag is absent, or the tag holds the QuickTime
+    zero-date sentinel (1904); the duration is ``None`` when unreadable.
     """
     exe = shutil.which("exiftool")
     if not exe:
-        return None
+        return None, None
     try:
         proc = subprocess.run(
-            [exe, "-api", "QuickTimeUTC=1", "-s3", "-d", "%Y-%m-%d %H:%M:%S",
-             "-MediaCreateDate", path],
+            [exe, "-api", "QuickTimeUTC=1", "-j", "-d", "%Y-%m-%d %H:%M:%S",
+             "-MediaCreateDate", "-Duration", path],
             capture_output=True, text=True, timeout=10,
         )
     except (OSError, subprocess.SubprocessError):
-        return None
-    value = proc.stdout.strip()
+        return None, None
+    try:
+        data = json.loads(proc.stdout)
+    except (ValueError, json.JSONDecodeError):
+        return None, None
+    if not data:
+        return None, None
+    info = data[0]
+    return (
+        _parse_create_date(info.get("MediaCreateDate")),
+        _parse_duration(info.get("Duration")),
+    )
+
+
+def read_recording_start(path: str) -> datetime | None:
+    """Return the real wall-clock time the recording started, or ``None``."""
+    return read_recording_info(path)[0]
+
+
+def _parse_create_date(value) -> datetime | None:
     if not value:
         return None
     try:
-        start = datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+        start = datetime.strptime(str(value).strip(), "%Y-%m-%d %H:%M:%S")
     except ValueError:
         return None
     # 1904-01-01 is QuickTime's epoch, written when no real date is set.
     if start.year < 1990:
         return None
     return start
+
+
+def _parse_duration(value) -> int | None:
+    """Parse an exiftool Duration value into milliseconds.
+
+    Handles both forms exiftool emits: ``"14.72 s"`` (seconds with a unit) and
+    ``"H:MM:SS"`` / ``"MM:SS"`` (clock form), plus a bare numeric of seconds.
+    """
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    if s.endswith("s") and ":" not in s:
+        try:
+            return int(round(float(s[:-1].strip()) * 1000))
+        except ValueError:
+            return None
+    try:
+        if ":" in s:
+            total = 0.0
+            for part in s.split(":"):
+                total = total * 60 + float(part)
+            return int(round(total * 1000))
+        return int(round(float(s) * 1000))
+    except ValueError:
+        return None
 
 
 def ms_to_realtime(start: datetime, ms: int) -> str:

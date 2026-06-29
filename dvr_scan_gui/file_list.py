@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor
@@ -57,15 +57,32 @@ class FileEntry:
     # (from the start of the file / to the end of the file).
     range_start_ms: int | None = None
     range_end_ms: int | None = None
-    # Real recording start time read from the file's metadata (lazily probed
-    # once: ``start_probed`` guards against re-running exiftool on files that
-    # have no usable timestamp).
+    # Real recording start time and media duration read from the file's
+    # metadata (lazily probed once together: ``start_probed`` guards against
+    # re-running exiftool on files that have no usable timestamp).
     recording_start: datetime | None = None
+    duration_ms: int | None = None
     start_probed: bool = False
+    # A clock start the user typed by hand, used for files whose metadata has
+    # no usable recording timestamp so they can still join the global timeline.
+    manual_start: datetime | None = None
 
     @property
     def name(self) -> str:
         return os.path.basename(self.path)
+
+    @property
+    def clock_start(self) -> datetime | None:
+        """The effective wall-clock start: metadata first, else a manual one."""
+        return self.recording_start or self.manual_start
+
+    @property
+    def clock_end(self) -> datetime | None:
+        """The wall-clock end, when both a clock start and a duration are known."""
+        start = self.clock_start
+        if start is None or self.duration_ms is None:
+            return None
+        return start + timedelta(milliseconds=self.duration_ms)
 
 
 _STATUS_TEXT = {
@@ -89,6 +106,14 @@ class FileItemWidget(QWidget):
 
         top = QHBoxLayout()
         top.setSpacing(6)
+
+        # A small play marker shown on the row whose file is currently feeding
+        # the player (used by the global timeline as it crosses clips).
+        self.playing_label = QLabel("▶")
+        self.playing_label.setStyleSheet("color: #5a82c8; font-size: 11px;")
+        self.playing_label.setVisible(False)
+        top.addWidget(self.playing_label, 0, Qt.AlignmentFlag.AlignVCenter)
+
         self.name_label = QLabel()
         self.name_label.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
         font = self.name_label.font()
@@ -115,6 +140,9 @@ class FileItemWidget(QWidget):
             "QProgressBar::chunk { background: #5a82c8; border-radius: 2px; }"
         )
         outer.addWidget(self.progress)
+
+    def set_playing(self, playing: bool) -> None:
+        self.playing_label.setVisible(playing)
 
     def update_view(self, entry: FileEntry, needs_update: bool) -> None:
         self.name_label.setText(entry.name)
