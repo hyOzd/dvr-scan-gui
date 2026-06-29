@@ -430,8 +430,9 @@ class TimelineSeekBar(QWidget):
         if self._duration_ms > 0:
             self._paint_ticks(painter, track)
 
-        # Playhead, extended down through the ruler (hidden when off the
-        # zoomed-in window).
+        # Playhead, extended down through the ruler. When zoomed in and the
+        # playhead falls outside the visible window, draw a small arrow at the
+        # nearer edge pointing toward it instead of the line.
         if self._duration_ms > 0:
             x = self._ms_to_x(self._position_ms)
             if track.left() - 1 <= x <= track.right() + 1:
@@ -441,6 +442,8 @@ class TimelineSeekBar(QWidget):
                 painter.drawRect(
                     QRectF(x - 1.0, track.top() - 4, 2.0, bottom - (track.top() - 4))
                 )
+            elif self._global:
+                self._paint_offscreen_playhead(painter, track, x < track.left())
 
     def _paint_coverage(self, painter: QPainter, track: QRectF) -> None:
         """Draw a thin line over the track wherever footage exists (global mode)."""
@@ -458,6 +461,27 @@ class TimelineSeekBar(QWidget):
             x0 = max(x0, track.left())
             x1 = min(x1, track.right())
             painter.drawRect(QRectF(x0, cy - height / 2, max(2.0, x1 - x0), height))
+
+    def _paint_offscreen_playhead(
+        self, painter: QPainter, track: QRectF, pointing_left: bool
+    ) -> None:
+        """Draw a small arrow at a track edge pointing to an off-window playhead."""
+        cy = track.center().y()
+        half_h = 5.0
+        width = 8.0
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(self._PLAYHEAD_COLOR)
+        if pointing_left:
+            tip_x = track.left() + 1.0
+            base_x = tip_x + width
+        else:
+            tip_x = track.right() - 1.0
+            base_x = tip_x - width
+        painter.drawPolygon(QPolygonF([
+            QPointF(tip_x, cy),
+            QPointF(base_x, cy - half_h),
+            QPointF(base_x, cy + half_h),
+        ]))
 
     def _paint_range(self, painter: QPainter, track: QRectF) -> None:
         start_x = self._ms_to_x(self._eff_start())
