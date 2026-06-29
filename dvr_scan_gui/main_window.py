@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
     QFileDialog,
+    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -302,6 +303,16 @@ class MainWindow(QMainWindow):
         region_row.addWidget(self.region_enabled_check)
 
         region_row.addStretch(1)
+
+        # Volume control tucked into the bottom-right of the player panel.
+        region_row.addWidget(QLabel("Volume"))
+        self.volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.volume_slider.setRange(0, 100)
+        self.volume_slider.setValue(80)
+        self.volume_slider.setFixedWidth(110)
+        self.volume_slider.valueChanged.connect(self._on_volume_changed)
+        region_row.addWidget(self.volume_slider)
+
         layout.addLayout(region_row)
 
         self.status_label = QLabel("Ready.")
@@ -321,7 +332,17 @@ class MainWindow(QMainWindow):
         self.timeline.rangeChanged.connect(self._on_range_changed)
         layout.addWidget(self.timeline)
 
-        controls = QHBoxLayout()
+        # Lay the controls out in three columns so the transport buttons sit in
+        # the true centre of the panel: the empty left column and the time
+        # read-out column share equal stretch, balancing each other out.
+        controls = QGridLayout()
+        controls.setContentsMargins(0, 0, 0, 0)
+        controls.setColumnStretch(0, 1)
+        controls.setColumnStretch(1, 0)
+        controls.setColumnStretch(2, 1)
+
+        transport = QHBoxLayout()
+        transport.setContentsMargins(0, 0, 0, 0)
         self.prev_event_button = QPushButton()
         self.prev_event_button.setIcon(
             self.style().standardIcon(QStyle.StandardPixmap.SP_MediaSkipBackward)
@@ -331,14 +352,14 @@ class MainWindow(QMainWindow):
         )
         self.prev_event_button.setEnabled(False)
         self.prev_event_button.clicked.connect(self._prev_event)
-        controls.addWidget(self.prev_event_button)
+        transport.addWidget(self.prev_event_button)
 
         self.play_button = QPushButton()
         self.play_button.setIcon(
             self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay)
         )
         self.play_button.clicked.connect(self._toggle_play)
-        controls.addWidget(self.play_button)
+        transport.addWidget(self.play_button)
 
         self.next_event_button = QPushButton()
         self.next_event_button.setIcon(
@@ -349,10 +370,13 @@ class MainWindow(QMainWindow):
         )
         self.next_event_button.setEnabled(False)
         self.next_event_button.clicked.connect(self._next_event)
-        controls.addWidget(self.next_event_button)
+        transport.addWidget(self.next_event_button)
+        controls.addLayout(transport, 0, 1)
 
+        time_box = QHBoxLayout()
+        time_box.setContentsMargins(0, 0, 0, 0)
         self.time_label = QLabel("00:00:00.000 / 00:00:00.000")
-        controls.addWidget(self.time_label)
+        time_box.addWidget(self.time_label)
 
         # Toggles the seek bar / time read-outs between file time and the real
         # recording clock time. Enabled only when the file carries a timestamp.
@@ -367,17 +391,10 @@ class MainWindow(QMainWindow):
             "No recording timestamp in this file's metadata."
         )
         self.time_mode_button.toggled.connect(self._on_time_mode_toggled)
-        controls.addWidget(self.time_mode_button)
-
-        controls.addStretch(1)
-
-        controls.addWidget(QLabel("Volume"))
-        self.volume_slider = QSlider(Qt.Orientation.Horizontal)
-        self.volume_slider.setRange(0, 100)
-        self.volume_slider.setValue(80)
-        self.volume_slider.setFixedWidth(110)
-        self.volume_slider.valueChanged.connect(self._on_volume_changed)
-        controls.addWidget(self.volume_slider)
+        time_box.addWidget(self.time_mode_button)
+        controls.addLayout(
+            time_box, 0, 2, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
 
         layout.addLayout(controls)
 
@@ -1103,11 +1120,9 @@ class MainWindow(QMainWindow):
 
     def _update_time_label(self, position_ms: int, duration_ms: int) -> None:
         if self._real_time_active():
-            start = self._recording_start
-            self.time_label.setText(
-                f"{ms_to_realtime(start, position_ms)} / "
-                f"{ms_to_realtime(start, duration_ms)}"
-            )
+            # Only the current clock time — an "end" wall-clock time alongside it
+            # reads ambiguously, so it's omitted in clock mode.
+            self.time_label.setText(ms_to_realtime(self._recording_start, position_ms))
         else:
             self.time_label.setText(
                 f"{ms_to_timecode(position_ms)} / {ms_to_timecode(duration_ms)}"
