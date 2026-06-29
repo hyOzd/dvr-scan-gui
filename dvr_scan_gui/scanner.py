@@ -96,10 +96,52 @@ def read_recording_info(path: str) -> tuple[datetime | None, int | None]:
     if not data:
         return None, None
     info = data[0]
-    return (
-        _parse_create_date(info.get("MediaCreateDate")),
-        _parse_duration(info.get("Duration")),
-    )
+    start = _parse_create_date(info.get("MediaCreateDate"))
+    duration_ms = _parse_duration(info.get("Duration"))
+    # Prefer the SMPTE start timecode's time-of-day when present. Split-clip
+    # cameras (notably GoPro) stamp every part of one recording with the *same*
+    # MediaCreateDate but a timecode that advances per part, so the timecode
+    # pinpoints each part's real start where the create date cannot. We keep the
+    # create date's calendar day and replace only the time-of-day.
+    if start is not None:
+        timecode = read_timecode(path)
+        if timecode is not None:
+            hour, minute, second = timecode
+            start = start.replace(hour=hour, minute=minute, second=second, microsecond=0)
+    return start, duration_ms
+
+
+def read_timecode(path: str) -> tuple[int, int, int] | None:
+    """Return ``(hour, minute, second)`` from the file's SMPTE start timecode.
+
+    exiftool can't decode GoPro-style timecodes, so this reads them via
+    ``ffprobe``. Returns ``None`` when ffprobe is missing, there is no timecode,
+    or it can't be parsed."""
+    exe = shutil.which("ffprobe")
+    if not exe:
+        return None
+    try:
+        proc = subprocess.run(
+            [exe, "-v", "error",
+             "-show_entries", "format_tags=timecode:stream_tags=timecode",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return _parse_timecode(proc.stdout)
+
+
+def _parse_timecode(text: str) -> tuple[int, int, int] | None:
+    """Parse an ``HH:MM:SS:FF`` (or drop-frame ``HH:MM:SS;FF``) timecode into a
+    ``(hour, minute, second)`` time-of-day (the frame field is ignored)."""
+    match = re.search(r"(\d{2}):(\d{2}):(\d{2})[:;]\d{2}", text or "")
+    if not match:
+        return None
+    hour, minute, second = (int(group) for group in match.groups())
+    if hour > 23 or minute > 59 or second > 59:
+        return None
+    return hour, minute, second
 
 
 def read_recording_start(path: str) -> datetime | None:

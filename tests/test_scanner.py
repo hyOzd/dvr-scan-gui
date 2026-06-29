@@ -9,6 +9,7 @@ from dvr_scan_gui.scanner import (
     ScanManager,
     ScanOptions,
     _parse_duration,
+    _parse_timecode,
     ms_to_timecode,
     parse_events,
     timecode_to_ms,
@@ -38,6 +39,23 @@ class DurationParseTests(unittest.TestCase):
         self.assertIsNone(_parse_duration(None))
         self.assertIsNone(_parse_duration(""))
         self.assertIsNone(_parse_duration("n/a"))
+
+
+class TimecodeMetadataTests(unittest.TestCase):
+    def test_smpte_non_drop(self):
+        self.assertEqual(_parse_timecode("11:30:00:56"), (11, 30, 0))
+
+    def test_smpte_drop_frame(self):
+        self.assertEqual(_parse_timecode("01:02:03;15"), (1, 2, 3))
+
+    def test_picks_first_in_multiline_output(self):
+        self.assertEqual(_parse_timecode("11:18:13:56\n11:18:13:56\n"), (11, 18, 13))
+
+    def test_rejects_garbage_and_out_of_range(self):
+        self.assertIsNone(_parse_timecode(""))
+        self.assertIsNone(_parse_timecode(None))
+        self.assertIsNone(_parse_timecode("not a timecode"))
+        self.assertIsNone(_parse_timecode("99:99:99:99"))
 
     def test_parse_known_timecodes(self):
         self.assertEqual(timecode_to_ms("00:00:00.533"), 533)
