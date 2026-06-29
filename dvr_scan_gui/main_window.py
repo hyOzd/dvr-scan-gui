@@ -154,7 +154,15 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(1, 1)
         splitter.setStretchFactor(2, 0)
         splitter.setSizes([300, 560, 250])
-        self.setCentralWidget(splitter)
+
+        # The three panels sit on top; the timeline and transport controls span
+        # the full window width beneath them.
+        central = QWidget()
+        central_layout = QVBoxLayout(central)
+        central_layout.setContentsMargins(0, 0, 0, 0)
+        central_layout.addWidget(splitter, 1)
+        central_layout.addWidget(self._build_timeline_bar())
+        self.setCentralWidget(central)
 
     def _build_actions(self) -> None:
         self.add_action = QAction("&Add files…", self)
@@ -296,6 +304,18 @@ class MainWindow(QMainWindow):
         region_row.addStretch(1)
         layout.addLayout(region_row)
 
+        self.status_label = QLabel("Ready.")
+        self.status_label.setStyleSheet("color: gray;")
+        layout.addWidget(self.status_label)
+
+        return container
+
+    def _build_timeline_bar(self) -> QWidget:
+        """The full-width timeline (seek bar) and transport controls that span
+        the bottom of the window."""
+        container = QWidget()
+        layout = QVBoxLayout(container)
+
         self.timeline = TimelineSeekBar()
         self.timeline.seekRequested.connect(self._on_user_seek)
         self.timeline.rangeChanged.connect(self._on_range_changed)
@@ -360,10 +380,6 @@ class MainWindow(QMainWindow):
         controls.addWidget(self.volume_slider)
 
         layout.addLayout(controls)
-
-        self.status_label = QLabel("Ready.")
-        self.status_label.setStyleSheet("color: gray;")
-        layout.addWidget(self.status_label)
 
         return container
 
