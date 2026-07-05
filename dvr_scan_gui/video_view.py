@@ -39,6 +39,8 @@ from PySide6.QtWidgets import (
     QGraphicsRectItem,
     QGraphicsScene,
     QGraphicsView,
+    QLabel,
+    QMenu,
 )
 
 TOOL_POINTER = "pointer"
@@ -89,6 +91,22 @@ class VideoView(QGraphicsView):
         self._scene.addItem(self.video_item)
         self.video_item.nativeSizeChanged.connect(self._on_native_size_changed)
 
+        # Playback-speed indicator, pinned to the top-right of the viewport. It
+        # is a plain child widget (not a scene item) so it stays a fixed size
+        # regardless of the video's scaling, and it ignores mouse events so it
+        # never interferes with region editing underneath it.
+        self._speed_text = ""
+        self._speed_overlay_enabled = True
+        self._speed_overlay = QLabel(self)
+        self._speed_overlay.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents
+        )
+        self._speed_overlay.setStyleSheet(
+            "background-color: rgba(0, 0, 0, 160); color: white;"
+            " padding: 2px 8px; border-radius: 4px; font-weight: bold;"
+        )
+        self._speed_overlay.hide()
+
         self._regions: list[QGraphicsPolygonItem] = []
         self._handles: list[QGraphicsRectItem] = []
         self._region_enabled = True
@@ -126,6 +144,40 @@ class VideoView(QGraphicsView):
     def can_edit(self) -> bool:
         """True once the video resolution is known (so pixel mapping works)."""
         return not self._video_size.isEmpty()
+
+    # ---- playback-speed overlay -------------------------------------------
+
+    def set_speed_text(self, text: str) -> None:
+        """Set the speed shown in the corner overlay (e.g. ``"2x"``).
+
+        An empty string means normal speed, which hides the overlay entirely.
+        """
+        self._speed_text = text
+        self._update_speed_overlay()
+
+    def is_speed_overlay_enabled(self) -> bool:
+        return self._speed_overlay_enabled
+
+    def set_speed_overlay_enabled(self, enabled: bool) -> None:
+        """User preference for whether the speed overlay may appear at all."""
+        self._speed_overlay_enabled = enabled
+        self._update_speed_overlay()
+
+    def _update_speed_overlay(self) -> None:
+        if self._speed_overlay_enabled and self._speed_text:
+            self._speed_overlay.setText(self._speed_text)
+            self._speed_overlay.adjustSize()
+            self._position_speed_overlay()
+            self._speed_overlay.show()
+        else:
+            self._speed_overlay.hide()
+
+    def _position_speed_overlay(self) -> None:
+        margin = 8
+        size = self._speed_overlay.size()
+        self._speed_overlay.move(
+            self.width() - size.width() - margin, margin
+        )
 
     # ---- region state -----------------------------------------------------
 
@@ -196,6 +248,7 @@ class VideoView(QGraphicsView):
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self._fit()
+        self._position_speed_overlay()
 
     def _fit(self) -> None:
         if not self._video_size.isEmpty():
@@ -380,6 +433,19 @@ class VideoView(QGraphicsView):
                 self._poly_close()
                 return
         super().keyPressEvent(event)
+
+    def contextMenuEvent(self, event) -> None:
+        # The polygon tool already uses right-click to drop the last vertex, so
+        # don't hijack it with a menu there.
+        if self._tool == TOOL_POLYGON:
+            return
+        menu = QMenu(self)
+        action = menu.addAction("Show speed indicator")
+        action.setCheckable(True)
+        action.setChecked(self._speed_overlay_enabled)
+        action.toggled.connect(self.set_speed_overlay_enabled)
+        menu.exec(event.globalPos())
+        event.accept()
 
     # ---- rectangle tool ---------------------------------------------------
 

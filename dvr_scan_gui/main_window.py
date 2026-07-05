@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QCalendarWidget,
     QCheckBox,
+    QComboBox,
     QDateTimeEdit,
     QDialog,
     QDialogButtonBox,
@@ -78,6 +79,20 @@ _VIDEO_FILTER = (
 # While playing, consecutive Previous presses within this window step one
 # event further back each time (instead of re-snapping to the current event).
 _PREV_CHAIN_SECONDS = 2.0
+
+# Selectable playback speeds, from slowest to fastest, with the labels shown in
+# the speed combo box and the corner overlay. 1x is normal speed.
+_PLAYBACK_SPEEDS: list[tuple[float, str]] = [
+    (0.25, "1/4x"),
+    (0.5, "1/2x"),
+    (1.0, "1x"),
+    (2.0, "2x"),
+    (4.0, "4x"),
+    (8.0, "8x"),
+    (16.0, "16x"),
+]
+_MIN_SPEED = _PLAYBACK_SPEEDS[0][0]
+_MAX_SPEED = _PLAYBACK_SPEEDS[-1][0]
 
 # The global timeline spans one whole day, measured in milliseconds.
 _MS_PER_DAY = 86_400_000
@@ -165,6 +180,8 @@ class MainWindow(QMainWindow):
         # Tracks a run of Previous presses so they walk backwards during playback.
         self._last_prev_time: float | None = None
         self._last_prev_start_ms: int | None = None
+        # Current playback speed (1.0 = normal); persists across file switches.
+        self._playback_rate = 1.0
 
         # Batch-scan bookkeeping.
         self._batch: set[str] = set()
@@ -182,6 +199,7 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._build_player()
+        self._set_playback_speed(self._playback_rate)  # sync combo/overlay/rate
 
         self._scanner.set_max_concurrent(self.config_panel.cores_spin.value())
         self._update_scan_buttons()
@@ -499,6 +517,31 @@ class MainWindow(QMainWindow):
         self.next_event_button.setEnabled(False)
         self.next_event_button.clicked.connect(self._next_event)
         transport.addWidget(self.next_event_button)
+
+        # Playback-speed controls: halve / pick / double. The combo box lets the
+        # user jump straight to a speed; the buttons step by a factor of two
+        # between _MIN_SPEED and _MAX_SPEED.
+        transport.addSpacing(16)
+
+        self.speed_down_button = QPushButton("÷2")
+        self.speed_down_button.setFixedWidth(36)
+        self.speed_down_button.setToolTip("Halve playback speed.")
+        self.speed_down_button.clicked.connect(lambda: self._step_speed(0.5))
+        transport.addWidget(self.speed_down_button)
+
+        self.speed_combo = QComboBox()
+        for _rate, label in _PLAYBACK_SPEEDS:
+            self.speed_combo.addItem(label)
+        self.speed_combo.setToolTip("Playback speed.")
+        self.speed_combo.currentIndexChanged.connect(self._on_speed_combo_changed)
+        transport.addWidget(self.speed_combo)
+
+        self.speed_up_button = QPushButton("×2")
+        self.speed_up_button.setFixedWidth(36)
+        self.speed_up_button.setToolTip("Double playback speed.")
+        self.speed_up_button.clicked.connect(lambda: self._step_speed(2.0))
+        transport.addWidget(self.speed_up_button)
+
         controls.addLayout(transport, 0, 1)
 
         time_box = QHBoxLayout()
@@ -1289,6 +1332,35 @@ class MainWindow(QMainWindow):
     def _on_volume_changed(self, value: int) -> None:
         self.audio.setVolume(value / 100.0)
 
+    # ---- playback speed ---------------------------------------------------
+
+    def _on_speed_combo_changed(self, index: int) -> None:
+        self._set_playback_speed(_PLAYBACK_SPEEDS[index][0])
+
+    def _step_speed(self, factor: float) -> None:
+        self._set_playback_speed(self._playback_rate * factor)
+
+    def _set_playback_speed(self, rate: float) -> None:
+        """Apply ``rate`` to the player, snapping to the nearest defined speed
+        and syncing the combo box, buttons and the corner overlay."""
+        rate = max(_MIN_SPEED, min(_MAX_SPEED, rate))
+        index = min(
+            range(len(_PLAYBACK_SPEEDS)),
+            key=lambda i: abs(_PLAYBACK_SPEEDS[i][0] - rate),
+        )
+        rate, label = _PLAYBACK_SPEEDS[index]
+        self._playback_rate = rate
+        self.player.setPlaybackRate(rate)
+
+        self.speed_combo.blockSignals(True)
+        self.speed_combo.setCurrentIndex(index)
+        self.speed_combo.blockSignals(False)
+        self.speed_down_button.setEnabled(rate > _MIN_SPEED)
+        self.speed_up_button.setEnabled(rate < _MAX_SPEED)
+
+        # Normal speed shows nothing; any other speed labels the overlay.
+        self.video_view.set_speed_text("" if rate == 1.0 else label)
+
     def _on_position_changed(self, position_ms: int) -> None:
         self._set_timeline_position(position_ms)
         self._update_time_label(position_ms, self.player.duration())
@@ -1364,6 +1436,8 @@ class MainWindow(QMainWindow):
         target = self._pending_seek_ms
         autoplay = self._pending_autoplay
         self._pending_autoplay = False
+        # Some backends reset the rate on a new source; re-assert the user's.
+        self.player.setPlaybackRate(self._playback_rate)
 
         if not target:
             # No seek needed (plain selection): render the first frame at once.
