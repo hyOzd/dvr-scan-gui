@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import html
 import os
+import re
 import time
 from datetime import date, datetime, timedelta
 
@@ -13,6 +15,7 @@ from PySide6.QtCore import (
     QStandardPaths,
     Qt,
     QTime,
+    QTimer,
     QUrl,
     Signal,
 )
@@ -60,6 +63,11 @@ from PySide6.QtWidgets import (
 )
 
 from .config_panel import ConfigPanel
+from .dependencies import (
+    check_all,
+    missing_optional,
+    missing_required,
+)
 from .file_list import (
     PATH_ROLE,
     STATUS_DONE,
@@ -155,6 +163,40 @@ _MS_PER_DAY = 86_400_000
 # Files whose footage overlaps by more than this are flagged (we still just
 # play the earlier-starting one); brief overlaps are common and ignored.
 _OVERLAP_WARN_MS = 5_000
+
+
+def _linkify(text: str) -> str:
+    """Escape *text* for rich display, turning http(s) URLs into links."""
+    parts = []
+    for token in re.split(r"(https?://\S+)", text):
+        if token.startswith("http"):
+            url = html.escape(token)
+            parts.append(f'<a href="{url}">{url}</a>')
+        else:
+            parts.append(html.escape(token).replace("\n", "<br>"))
+    return "".join(parts)
+
+
+def _dependency_report_html(statuses) -> str:
+    """Render dependency :class:`ToolStatus` items as an HTML block."""
+    rows = []
+    for status in statuses:
+        tool = status.tool
+        kind = "required" if tool.required else "optional"
+        if status.found:
+            label = "Bundled" if status.bundled else "Found"
+            state = f'<span style="color:#2e7d32;">&#10003; {label}</span>'
+            detail = html.escape(status.path)
+        else:
+            state = '<span style="color:#c0392b;">&#10007; Not found</span>'
+            detail = _linkify(tool.install_hint())
+        rows.append(
+            f"<p><b>{html.escape(tool.label)}</b> "
+            f"<span style='color:gray;'>({kind})</span><br>"
+            f"{html.escape(tool.purpose)}<br>"
+            f"{state} &mdash; {detail}</p>"
+        )
+    return "".join(rows)
 
 
 def compute_day_segments(
@@ -263,10 +305,60 @@ class MainWindow(QMainWindow):
         self._scanner.set_max_concurrent(self.config_panel.cores_spin.value())
         self._update_scan_buttons()
 
-        if self._scanner.executable() is None:
+        self._check_dependencies_on_startup()
+
+    # ---- Dependency checks ------------------------------------------------
+
+    def _check_dependencies_on_startup(self) -> None:
+        """Surface missing tools at launch.
+
+        A missing *required* tool (dvr-scan) blocks scanning, so the full
+        dependency dialog is opened automatically. Missing *optional* tools
+        (ffprobe) only disable the clock-time features, so they get a status-bar
+        hint pointing at Help ▸ Dependencies rather than an intrusive dialog.
+        """
+        statuses = check_all()
+        need = missing_required(statuses)
+        optional = missing_optional(statuses)
+        if need:
+            names = ", ".join(s.tool.label for s in need)
             self._set_status(
-                "dvr-scan not found on PATH — install it with 'pip install dvr-scan'."
+                f"Missing required dependency: {names}. See Help ▸ Dependencies."
             )
+            # Defer so the main window paints before the modal dialog appears.
+            QTimer.singleShot(0, self._open_dependencies_dialog)
+        elif optional:
+            names = ", ".join(s.tool.label for s in optional)
+            self._set_status(
+                f"{names} not found — clock-time features are disabled. "
+                "See Help ▸ Dependencies."
+            )
+
+    def _open_dependencies_dialog(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Dependencies")
+        dialog.setMinimumWidth(480)
+        layout = QVBoxLayout(dialog)
+
+        intro = QLabel(
+            "DVR-Scan GUI relies on the external tools below. Install any that "
+            "are missing, then restart the app."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        body = QLabel(_dependency_report_html(check_all()))
+        body.setTextFormat(Qt.TextFormat.RichText)
+        body.setWordWrap(True)
+        body.setOpenExternalLinks(True)
+        body.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        layout.addWidget(body)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dialog.reject)
+        buttons.accepted.connect(dialog.accept)
+        layout.addWidget(buttons)
+        dialog.exec()
 
     # ---- UI construction --------------------------------------------------
 
@@ -317,6 +409,11 @@ class MainWindow(QMainWindow):
         file_menu = self.menuBar().addMenu("&File")
         file_menu.addAction(self.add_action)
         file_menu.addAction(self.remove_action)
+
+        self.deps_action = QAction("&Dependencies…", self)
+        self.deps_action.triggered.connect(self._open_dependencies_dialog)
+        help_menu = self.menuBar().addMenu("&Help")
+        help_menu.addAction(self.deps_action)
 
     def _build_files_side(self) -> QWidget:
         container = QWidget()
@@ -923,7 +1020,7 @@ class MainWindow(QMainWindow):
         self._refresh_timeline_mode()
 
     def _ensure_probed(self, entry: FileEntry) -> None:
-        """Read this file's recording start and duration once (via exiftool)."""
+        """Read this file's recording start and duration once (via ffprobe)."""
         if entry.start_probed:
             return
         entry.recording_start, entry.duration_ms = read_recording_info(entry.path)
@@ -1076,12 +1173,7 @@ class MainWindow(QMainWindow):
 
     def _begin_batch(self, paths: list[str]) -> None:
         if self._scanner.executable() is None:
-            QMessageBox.critical(
-                self,
-                "dvr-scan not found",
-                "Could not find the 'dvr-scan' executable on PATH.\n"
-                "Install it with 'pip install dvr-scan'.",
-            )
+            self._open_dependencies_dialog()
             return
         paths = [p for p in paths if p in self._entries]
         if not paths:

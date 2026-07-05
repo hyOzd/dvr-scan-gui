@@ -3,11 +3,15 @@
 Run with:  pipenv run python -m pytest   (or: python -m unittest)
 """
 
+import os
+import time
 import unittest
+from datetime import datetime
 
 from dvr_scan_gui.scanner import (
     ScanManager,
     ScanOptions,
+    _parse_create_date,
     _parse_duration,
     _parse_timecode,
     ms_to_timecode,
@@ -35,10 +39,61 @@ class DurationParseTests(unittest.TestCase):
     def test_bare_seconds(self):
         self.assertEqual(_parse_duration("14.72"), 14_720)
 
+    def test_ffprobe_float_seconds(self):
+        # ffprobe emits format.duration as a bare float string.
+        self.assertEqual(_parse_duration("14.719771"), 14_720)
+        self.assertEqual(_parse_duration("707.712000"), 707_712)
+
     def test_unparseable_or_missing(self):
         self.assertIsNone(_parse_duration(None))
         self.assertIsNone(_parse_duration(""))
         self.assertIsNone(_parse_duration("n/a"))
+
+
+class CreateDateParseTests(unittest.TestCase):
+    """ffprobe emits creation_time as ISO-8601 UTC; we convert to local time."""
+
+    def _with_tz(self, tz, value):
+        if not hasattr(time, "tzset"):
+            self.skipTest("time.tzset unavailable on this platform")
+        old = os.environ.get("TZ")
+        os.environ["TZ"] = tz
+        time.tzset()
+        try:
+            return _parse_create_date(value)
+        finally:
+            if old is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = old
+            time.tzset()
+
+    def test_utc_converted_to_local(self):
+        # Istanbul is a fixed UTC+3 (no DST since 2016): 22:18Z -> 01:18 next day.
+        self.assertEqual(
+            self._with_tz("Europe/Istanbul", "2026-06-25T22:18:53.000000Z"),
+            datetime(2026, 6, 26, 1, 18, 53),
+        )
+
+    def test_utc_zone_is_identity(self):
+        self.assertEqual(
+            self._with_tz("UTC", "2025-06-01T11:18:54.000000Z"),
+            datetime(2025, 6, 1, 11, 18, 54),
+        )
+
+    def test_without_fractional_seconds(self):
+        self.assertEqual(
+            self._with_tz("UTC", "2025-06-01T11:18:54Z"),
+            datetime(2025, 6, 1, 11, 18, 54),
+        )
+
+    def test_sentinel_and_missing_rejected(self):
+        self.assertIsNone(_parse_create_date(None))
+        self.assertIsNone(_parse_create_date(""))
+        self.assertIsNone(_parse_create_date("N/A"))
+        self.assertIsNone(_parse_create_date("not a date"))
+        # QuickTime zero-date sentinel is discarded.
+        self.assertIsNone(self._with_tz("UTC", "1904-01-01T00:00:00.000000Z"))
 
 
 class TimecodeMetadataTests(unittest.TestCase):

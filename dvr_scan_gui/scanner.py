@@ -19,12 +19,13 @@ from __future__ import annotations
 
 import json
 import re
-import shutil
 import subprocess
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from PySide6.QtCore import QObject, QProcess, Signal
+
+from .dependencies import find_tool, no_window_kwargs
 
 
 @dataclass(frozen=True)
@@ -70,22 +71,23 @@ def ms_to_timecode(ms: int) -> str:
 def read_recording_info(path: str) -> tuple[datetime | None, int | None]:
     """Return ``(recording_start, duration_ms)`` for a video, either ``None``.
 
-    Reads the *Media Create Date* and *Duration* metadata in a single
-    ``exiftool`` call. QuickTime / MP4 create-date tags are stored in UTC, so
-    ``-api QuickTimeUTC=1`` converts the value to local time, giving the actual
-    moment the clip began. JSON output (``-j``) is used so the two tags can be
-    told apart by name even when one is absent. The start is ``None`` when
-    exiftool is missing, the tag is absent, or the tag holds the QuickTime
+    Reads the container's *creation_time* tag and *duration* in a single
+    ``ffprobe`` call. MP4 / QuickTime creation times are stored in UTC (ffprobe
+    emits them as ISO-8601 with a trailing ``Z``), so the value is converted to
+    local time, giving the actual moment the clip began. The start is ``None``
+    when ffprobe is missing, the tag is absent, or it holds the QuickTime
     zero-date sentinel (1904); the duration is ``None`` when unreadable.
     """
-    exe = shutil.which("exiftool")
+    exe = find_tool("ffprobe")
     if not exe:
         return None, None
     try:
         proc = subprocess.run(
-            [exe, "-api", "QuickTimeUTC=1", "-j", "-d", "%Y-%m-%d %H:%M:%S",
-             "-MediaCreateDate", "-Duration", path],
+            [exe, "-v", "error",
+             "-show_entries", "format=duration:format_tags=creation_time",
+             "-of", "json", path],
             capture_output=True, text=True, timeout=10,
+            **no_window_kwargs(),
         )
     except (OSError, subprocess.SubprocessError):
         return None, None
@@ -93,14 +95,13 @@ def read_recording_info(path: str) -> tuple[datetime | None, int | None]:
         data = json.loads(proc.stdout)
     except (ValueError, json.JSONDecodeError):
         return None, None
-    if not data:
-        return None, None
-    info = data[0]
-    start = _parse_create_date(info.get("MediaCreateDate"))
-    duration_ms = _parse_duration(info.get("Duration"))
+    fmt = data.get("format", {}) if isinstance(data, dict) else {}
+    tags = fmt.get("tags", {}) if isinstance(fmt, dict) else {}
+    start = _parse_create_date(tags.get("creation_time"))
+    duration_ms = _parse_duration(fmt.get("duration"))
     # Prefer the SMPTE start timecode's time-of-day when present. Split-clip
     # cameras (notably GoPro) stamp every part of one recording with the *same*
-    # MediaCreateDate but a timecode that advances per part, so the timecode
+    # creation_time but a timecode that advances per part, so the timecode
     # pinpoints each part's real start where the create date cannot. We keep the
     # create date's calendar day and replace only the time-of-day.
     if start is not None:
@@ -114,10 +115,10 @@ def read_recording_info(path: str) -> tuple[datetime | None, int | None]:
 def read_timecode(path: str) -> tuple[int, int, int] | None:
     """Return ``(hour, minute, second)`` from the file's SMPTE start timecode.
 
-    exiftool can't decode GoPro-style timecodes, so this reads them via
-    ``ffprobe``. Returns ``None`` when ffprobe is missing, there is no timecode,
-    or it can't be parsed."""
-    exe = shutil.which("ffprobe")
+    Read via ``ffprobe`` from the format/stream ``timecode`` tags. Returns
+    ``None`` when ffprobe is missing, there is no timecode, or it can't be
+    parsed."""
+    exe = find_tool("ffprobe")
     if not exe:
         return None
     try:
@@ -126,6 +127,7 @@ def read_timecode(path: str) -> tuple[int, int, int] | None:
              "-show_entries", "format_tags=timecode:stream_tags=timecode",
              "-of", "default=noprint_wrappers=1:nokey=1", path],
             capture_output=True, text=True, timeout=10,
+            **no_window_kwargs(),
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -150,12 +152,27 @@ def read_recording_start(path: str) -> datetime | None:
 
 
 def _parse_create_date(value) -> datetime | None:
+    """Parse ffprobe's ``creation_time`` (ISO-8601 UTC) into naive local time.
+
+    ffprobe emits e.g. ``2025-06-01T11:18:54.000000Z``; the instant is in UTC,
+    so it is converted to the local wall-clock time the recording began and the
+    tzinfo dropped (the rest of the app works in naive-local datetimes).
+    """
     if not value:
         return None
-    try:
-        start = datetime.strptime(str(value).strip(), "%Y-%m-%d %H:%M:%S")
-    except ValueError:
+    s = str(value).strip()
+    if not s or s.upper() == "N/A":
         return None
+    start = None
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
+        try:
+            start = datetime.strptime(s, fmt)
+            break
+        except ValueError:
+            continue
+    if start is None:
+        return None
+    start = start.replace(tzinfo=timezone.utc).astimezone().replace(tzinfo=None)
     # 1904-01-01 is QuickTime's epoch, written when no real date is set.
     if start.year < 1990:
         return None
@@ -263,7 +280,7 @@ class ScanOptions:
 
 def find_executable() -> str | None:
     """Locate the dvr-scan executable, or None if it is not installed."""
-    return shutil.which("dvr-scan")
+    return find_tool("dvr-scan")
 
 
 class ScanWorker(QObject):

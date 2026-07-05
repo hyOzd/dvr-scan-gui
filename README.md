@@ -55,9 +55,24 @@ writes any extracted video clips to disk. The original video drives the player.
 
 - Python 3.12
 - [`dvr-scan`](https://pypi.org/project/dvr-scan/) on your `PATH`
-  (`pip install dvr-scan`)
+  (`pip install dvr-scan`) — **required** for scanning.
+- `ffprobe` on your `PATH` (part of [FFmpeg](https://ffmpeg.org/), e.g.
+  `sudo apt install ffmpeg`) — *optional*; used to read each recording's start
+  time and duration for the clock-time / global-timeline features. Without it,
+  those features are simply unavailable.
 - Playback uses Qt Multimedia. PySide6 6.11 ships a bundled FFmpeg backend, so
   no extra system media packages are normally required.
+
+The app checks these tools at launch and reports what is found or missing under
+**Help ▸ Dependencies**.
+
+### Packaged builds
+
+Prebuilt single-file executables for Windows and Linux are produced by the
+GitHub Actions *Build* workflow (attached to tagged releases). The **Windows**
+build bundles `ffprobe`, so Windows users only need to install `dvr-scan`
+separately. The **Linux** build expects `dvr-scan` and `ffmpeg` from your
+package manager / pip.
 
 ## Setup
 
