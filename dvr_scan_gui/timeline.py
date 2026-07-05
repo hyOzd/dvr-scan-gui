@@ -239,6 +239,16 @@ class TimelineSeekBar(QWidget):
     def duration_ms(self) -> int:
         return self._duration_ms
 
+    def position_ms(self) -> int:
+        return self._position_ms
+
+    def events(self) -> list[MotionEvent]:
+        return self._events
+
+    def format_time(self, ms: int) -> str:
+        """Public wrapper over the current display-mode time formatting."""
+        return self._fmt(ms)
+
     def set_position(self, position_ms: int) -> None:
         self._position_ms = max(0, int(position_ms))
         self.update()
@@ -890,3 +900,145 @@ class TimelineSeekBar(QWidget):
     def resizeEvent(self, event) -> None:  # noqa: N802 (Qt naming)
         super().resizeEvent(event)
         self._reposition_editors()
+
+
+class MiniSeekBar(QWidget):
+    """A minimal seek bar for the fullscreen player.
+
+    It is a thin line pinned to the bottom edge that thickens on hover so it
+    can be scrubbed. It paints the played portion, the detected motion events
+    and the playhead, and shows a time bubble under the cursor — but no ticks,
+    labels or scan-range handles (those belong to the full timeline).
+
+    Signals:
+        seekRequested(int): a millisecond position the user clicked/dragged to.
+    """
+
+    seekRequested = Signal(int)
+
+    _TRACK_COLOR = QColor(70, 70, 78, 150)
+    _PLAYED_COLOR = QColor(90, 130, 200)
+    _EVENT_COLOR = QColor(232, 120, 70, 230)
+    _PLAYHEAD_COLOR = QColor(245, 245, 245)
+
+    _THIN = 3.0     # resting track height
+    _THICK = 10.0   # track height while hovered
+    _HEIGHT = 42    # widget height (leaves room for the hover bubble)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._duration_ms = 0
+        self._position_ms = 0
+        self._events: list[MotionEvent] = []
+        self._hovered = False
+        self._fmt_func = ms_to_timecode
+        self.setFixedHeight(self._HEIGHT)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._hover_label = _HoverReadout(self)
+
+    # ---- public API -------------------------------------------------------
+
+    def set_duration(self, duration_ms: int) -> None:
+        self._duration_ms = max(0, int(duration_ms))
+        self.update()
+
+    def set_position(self, position_ms: int) -> None:
+        self._position_ms = max(0, int(position_ms))
+        self.update()
+
+    def set_events(self, events: list[MotionEvent]) -> None:
+        self._events = list(events)
+        self.update()
+
+    def set_formatter(self, fmt_func) -> None:
+        """Set the callable used to render the hover time bubble (ms -> str)."""
+        self._fmt_func = fmt_func
+
+    # ---- geometry ---------------------------------------------------------
+
+    def _track_rect(self) -> QRectF:
+        h = self._THICK if self._hovered else self._THIN
+        return QRectF(0.0, self.height() - h, float(self.width()), h)
+
+    def _x_to_ms(self, x: float) -> int:
+        w = self.width()
+        if w <= 0 or self._duration_ms <= 0:
+            return 0
+        ratio = max(0.0, min(1.0, x / w))
+        return int(round(ratio * self._duration_ms))
+
+    def _ms_to_x(self, ms: int) -> float:
+        if self._duration_ms <= 0:
+            return 0.0
+        return (ms / self._duration_ms) * self.width()
+
+    # ---- painting ---------------------------------------------------------
+
+    def paintEvent(self, _event: QPaintEvent) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        track = self._track_rect()
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(self._TRACK_COLOR)
+        painter.drawRect(track)
+
+        if self._duration_ms <= 0:
+            return
+
+        # Played portion.
+        played = QRectF(track)
+        played.setRight(self._ms_to_x(self._position_ms))
+        painter.setBrush(self._PLAYED_COLOR)
+        painter.drawRect(played)
+
+        # Motion-event bands.
+        painter.setBrush(self._EVENT_COLOR)
+        for event in self._events:
+            left = self._ms_to_x(event.start_ms)
+            right = self._ms_to_x(event.end_ms)
+            painter.drawRect(
+                QRectF(left, track.top(), max(2.0, right - left), track.height())
+            )
+
+        # Playhead.
+        x = self._ms_to_x(self._position_ms)
+        painter.setBrush(self._PLAYHEAD_COLOR)
+        painter.drawRect(QRectF(x - 1.0, track.top(), 2.0, track.height()))
+
+    # ---- interaction ------------------------------------------------------
+
+    def _show_hover(self, x: float) -> None:
+        if self._duration_ms <= 0:
+            self._hover_label.setVisible(False)
+            return
+        self._hover_label.set_text(self._fmt_func(self._x_to_ms(x)))
+        w = self._hover_label.width()
+        h = self._hover_label.height()
+        lx = max(0.0, min(x - w / 2, self.width() - w))
+        y = max(0.0, self._track_rect().top() - 2 - h)
+        self._hover_label.move(int(lx), int(y))
+        self._hover_label.setVisible(True)
+        self._hover_label.raise_()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self._duration_ms > 0:
+            self.seekRequested.emit(self._x_to_ms(event.position().x()))
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        x = event.position().x()
+        if event.buttons() & Qt.MouseButton.LeftButton and self._duration_ms > 0:
+            self.seekRequested.emit(self._x_to_ms(x))
+        self._show_hover(x)
+
+    def enterEvent(self, event) -> None:  # noqa: N802 (Qt naming)
+        self._hovered = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802 (Qt naming)
+        self._hovered = False
+        self._hover_label.setVisible(False)
+        self.update()
+        super().leaveEvent(event)

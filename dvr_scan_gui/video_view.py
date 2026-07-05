@@ -22,7 +22,7 @@ disabled (kept on screen but excluded from the scan).
 
 from __future__ import annotations
 
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -34,6 +34,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
 from PySide6.QtWidgets import (
+    QApplication,
     QGraphicsItem,
     QGraphicsPolygonItem,
     QGraphicsRectItem,
@@ -69,6 +70,7 @@ class VideoView(QGraphicsView):
     regionsChanged = Signal()
     toolReset = Signal()
     playPauseRequested = Signal()
+    fullscreenToggleRequested = Signal()
 
     _ACTIVE_PEN = _dashed_pen(QColor(255, 196, 0))
     _DISABLED_PEN = _dashed_pen(QColor(150, 150, 150))
@@ -98,6 +100,13 @@ class VideoView(QGraphicsView):
         # never interferes with region editing underneath it.
         self._speed_text = ""
         self._speed_overlay_enabled = True
+
+        # A single click on the video toggles play/pause, but a double-click
+        # toggles fullscreen — so the play toggle is deferred by the platform's
+        # double-click interval and cancelled if a double-click follows.
+        self._click_timer = QTimer(self)
+        self._click_timer.setSingleShot(True)
+        self._click_timer.timeout.connect(self.playPauseRequested)
         self._speed_overlay = QLabel(self)
         self._speed_overlay.setAttribute(
             Qt.WidgetAttribute.WA_TransparentForMouseEvents
@@ -423,6 +432,11 @@ class VideoView(QGraphicsView):
         if self._tool == TOOL_POLYGON:
             self._poly_close()
             return event.accept()
+        if self._tool == TOOL_POINTER and not self._video_size.isEmpty():
+            # Cancel the pending single-click play toggle; go fullscreen instead.
+            self._click_timer.stop()
+            self.fullscreenToggleRequested.emit()
+            return event.accept()
         super().mouseDoubleClickEvent(event)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
@@ -537,8 +551,9 @@ class VideoView(QGraphicsView):
         found = self._find_vertex(point)
         if found is None:
             # A plain click on the video (not on a corner handle) toggles
-            # playback — the pointer tool isn't a drawing mode.
-            self.playPauseRequested.emit()
+            # playback — the pointer tool isn't a drawing mode. Defer it so a
+            # double-click (fullscreen) can cancel it first.
+            self._click_timer.start(QApplication.doubleClickInterval())
             event.accept()
             return
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:

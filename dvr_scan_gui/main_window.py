@@ -6,8 +6,25 @@ import os
 import time
 from datetime import date, datetime, timedelta
 
-from PySide6.QtCore import QDate, QDateTime, QSize, QStandardPaths, Qt, QTime, QUrl
-from PySide6.QtGui import QAction, QColor, QFont, QKeySequence, QPalette, QTextCharFormat
+from PySide6.QtCore import (
+    QDate,
+    QDateTime,
+    QSize,
+    QStandardPaths,
+    Qt,
+    QTime,
+    QUrl,
+    Signal,
+)
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QFont,
+    QKeySequence,
+    QPalette,
+    QShortcut,
+    QTextCharFormat,
+)
 from PySide6.QtMultimedia import QAudioOutput, QMediaMetaData, QMediaPlayer
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -62,7 +79,7 @@ from .scanner import (
     ms_to_timecode,
     read_recording_info,
 )
-from .timeline import TimelineSeekBar
+from .timeline import MiniSeekBar, TimelineSeekBar
 from .video_view import (
     TOOL_DELETE,
     TOOL_POINTER,
@@ -93,6 +110,45 @@ _PLAYBACK_SPEEDS: list[tuple[float, str]] = [
 ]
 _MIN_SPEED = _PLAYBACK_SPEEDS[0][0]
 _MAX_SPEED = _PLAYBACK_SPEEDS[-1][0]
+
+class _FullscreenWindow(QWidget):
+    """A borderless top-level window that hosts the video during fullscreen.
+
+    The video widget fills the window and the mini seek bar overlays its
+    bottom edge. Pressing Esc (or double-clicking the video) exits.
+    """
+
+    exitRequested = Signal()
+
+    def __init__(self, seekbar: MiniSeekBar) -> None:
+        super().__init__()
+        self.setWindowTitle("Player — Fullscreen")
+        self.setStyleSheet("background-color: black;")
+        self._seekbar = seekbar
+        self._seekbar.setParent(self)
+        self._video: QWidget | None = None
+
+    def set_video(self, video_widget: QWidget) -> None:
+        video_widget.setParent(self)
+        self._video = video_widget
+        self._layout_children()
+        video_widget.lower()
+        self._seekbar.raise_()
+
+    def _layout_children(self) -> None:
+        if self._video is not None:
+            self._video.setGeometry(0, 0, self.width(), self.height())
+        h = self._seekbar.height()
+        self._seekbar.setGeometry(0, self.height() - h, self.width(), h)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 (Qt naming)
+        super().resizeEvent(event)
+        self._layout_children()
+
+    def closeEvent(self, event) -> None:  # noqa: N802 (Qt naming)
+        self.exitRequested.emit()
+        super().closeEvent(event)
+
 
 # The global timeline spans one whole day, measured in milliseconds.
 _MS_PER_DAY = 86_400_000
@@ -182,6 +238,9 @@ class MainWindow(QMainWindow):
         self._last_prev_start_ms: int | None = None
         # Current playback speed (1.0 = normal); persists across file switches.
         self._playback_rate = 1.0
+        # Fullscreen player: the top-level window and its mini seek bar, or None.
+        self._fs_window: _FullscreenWindow | None = None
+        self._fs_bar: MiniSeekBar | None = None
 
         # Batch-scan bookkeeping.
         self._batch: set[str] = set()
@@ -367,6 +426,8 @@ class MainWindow(QMainWindow):
         self.video_view.toolReset.connect(self._on_tool_reset)
         self.video_view.regionsChanged.connect(self._on_regions_changed)
         self.video_view.playPauseRequested.connect(self._toggle_play)
+        self.video_view.fullscreenToggleRequested.connect(self._toggle_fullscreen)
+        self._player_side_layout = layout
         layout.addWidget(self.video_view, 1)
 
         # Detection-region tool bar.
@@ -920,6 +981,7 @@ class MainWindow(QMainWindow):
         # _refresh_global_view); here it shows only the current file's.
         if not self._global_active:
             self.timeline.set_events(self._events)
+        self._sync_fs_bar()
 
     # ---- detection region -------------------------------------------------
 
@@ -1329,6 +1391,7 @@ class MainWindow(QMainWindow):
             self.timeline.set_position(base + int(file_ms))
         else:
             self.timeline.set_position(int(file_ms))
+        self._sync_fs_bar()
 
     def _toggle_play(self) -> None:
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
@@ -1338,6 +1401,51 @@ class MainWindow(QMainWindow):
 
     def _on_volume_changed(self, value: int) -> None:
         self.audio.setVolume(value / 100.0)
+
+    # ---- fullscreen player ------------------------------------------------
+
+    def _toggle_fullscreen(self) -> None:
+        if self._fs_window is None:
+            self._enter_fullscreen()
+        else:
+            self._exit_fullscreen()
+
+    def _enter_fullscreen(self) -> None:
+        if self._fs_window is not None:
+            return
+        self._fs_bar = MiniSeekBar()
+        self._fs_bar.seekRequested.connect(self._on_user_seek)
+        window = _FullscreenWindow(self._fs_bar)
+        window.exitRequested.connect(self._exit_fullscreen)
+        # Esc leaves fullscreen even while the video view holds keyboard focus.
+        shortcut = QShortcut(QKeySequence(Qt.Key.Key_Escape), window)
+        shortcut.activated.connect(self._exit_fullscreen)
+        window.set_video(self.video_view)
+        self._fs_window = window
+        self._sync_fs_bar()
+        window.showFullScreen()
+        self.video_view.setFocus()
+
+    def _exit_fullscreen(self) -> None:
+        window = self._fs_window
+        if window is None:
+            return
+        # Clear state first so the window's closeEvent doesn't re-enter here.
+        self._fs_window = None
+        self._fs_bar = None
+        # Return the video view to the top of the player panel.
+        self._player_side_layout.insertWidget(0, self.video_view, 1)
+        window.close()
+        window.deleteLater()
+
+    def _sync_fs_bar(self) -> None:
+        """Mirror the main timeline's playback state onto the mini seek bar."""
+        if self._fs_bar is None:
+            return
+        self._fs_bar.set_formatter(self.timeline.format_time)
+        self._fs_bar.set_duration(self.timeline.duration_ms())
+        self._fs_bar.set_position(self.timeline.position_ms())
+        self._fs_bar.set_events(self.timeline.events())
 
     # ---- playback speed ---------------------------------------------------
 
@@ -1414,6 +1522,7 @@ class MainWindow(QMainWindow):
             self._update_time_label(self.player.position(), duration_ms)
             # Restore this file's saved scan range now that its length is known.
             self._apply_range_for_current()
+        self._sync_fs_bar()
         if duration_ms > 0:
             self._apply_pending_playback()
 
