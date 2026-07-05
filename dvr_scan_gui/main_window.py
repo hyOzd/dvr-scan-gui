@@ -366,6 +366,7 @@ class MainWindow(QMainWindow):
         self.video_view = VideoView()
         self.video_view.toolReset.connect(self._on_tool_reset)
         self.video_view.regionsChanged.connect(self._on_regions_changed)
+        self.video_view.playPauseRequested.connect(self._toggle_play)
         layout.addWidget(self.video_view, 1)
 
         # Detection-region tool bar.

@@ -68,6 +68,7 @@ class VideoView(QGraphicsView):
 
     regionsChanged = Signal()
     toolReset = Signal()
+    playPauseRequested = Signal()
 
     _ACTIVE_PEN = _dashed_pen(QColor(255, 196, 0))
     _DISABLED_PEN = _dashed_pen(QColor(150, 150, 150))
@@ -535,6 +536,10 @@ class VideoView(QGraphicsView):
             return
         found = self._find_vertex(point)
         if found is None:
+            # A plain click on the video (not on a corner handle) toggles
+            # playback — the pointer tool isn't a drawing mode.
+            self.playPauseRequested.emit()
+            event.accept()
             return
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
             self._delete_vertex(*found)  # Ctrl+click removes the vertex
