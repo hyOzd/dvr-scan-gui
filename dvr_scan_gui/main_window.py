@@ -517,31 +517,6 @@ class MainWindow(QMainWindow):
         self.next_event_button.setEnabled(False)
         self.next_event_button.clicked.connect(self._next_event)
         transport.addWidget(self.next_event_button)
-
-        # Playback-speed controls: halve / pick / double. The combo box lets the
-        # user jump straight to a speed; the buttons step by a factor of two
-        # between _MIN_SPEED and _MAX_SPEED.
-        transport.addSpacing(16)
-
-        self.speed_down_button = QPushButton("÷2")
-        self.speed_down_button.setFixedWidth(36)
-        self.speed_down_button.setToolTip("Halve playback speed.")
-        self.speed_down_button.clicked.connect(lambda: self._step_speed(0.5))
-        transport.addWidget(self.speed_down_button)
-
-        self.speed_combo = QComboBox()
-        for _rate, label in _PLAYBACK_SPEEDS:
-            self.speed_combo.addItem(label)
-        self.speed_combo.setToolTip("Playback speed.")
-        self.speed_combo.currentIndexChanged.connect(self._on_speed_combo_changed)
-        transport.addWidget(self.speed_combo)
-
-        self.speed_up_button = QPushButton("×2")
-        self.speed_up_button.setFixedWidth(36)
-        self.speed_up_button.setToolTip("Double playback speed.")
-        self.speed_up_button.clicked.connect(lambda: self._step_speed(2.0))
-        transport.addWidget(self.speed_up_button)
-
         controls.addLayout(transport, 0, 1)
 
         time_box = QHBoxLayout()
@@ -563,6 +538,31 @@ class MainWindow(QMainWindow):
         )
         self.time_mode_button.toggled.connect(self._on_time_mode_toggled)
         time_box.addWidget(self.time_mode_button)
+
+        # Playback-speed controls: halve / pick / double. The combo box lets the
+        # user jump straight to a speed; the buttons step by a factor of two
+        # between _MIN_SPEED and _MAX_SPEED.
+        time_box.addSpacing(16)
+
+        self.speed_down_button = QPushButton("÷2")
+        self.speed_down_button.setFixedWidth(36)
+        self.speed_down_button.setToolTip("Halve playback speed.")
+        self.speed_down_button.clicked.connect(lambda: self._step_speed(0.5))
+        time_box.addWidget(self.speed_down_button)
+
+        self.speed_combo = QComboBox()
+        for _rate, label in _PLAYBACK_SPEEDS:
+            self.speed_combo.addItem(label)
+        self.speed_combo.setToolTip("Playback speed.")
+        self.speed_combo.currentIndexChanged.connect(self._on_speed_combo_changed)
+        time_box.addWidget(self.speed_combo)
+
+        self.speed_up_button = QPushButton("×2")
+        self.speed_up_button.setFixedWidth(36)
+        self.speed_up_button.setToolTip("Double playback speed.")
+        self.speed_up_button.clicked.connect(lambda: self._step_speed(2.0))
+        time_box.addWidget(self.speed_up_button)
+
         controls.addLayout(
             time_box, 0, 2, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
         )
