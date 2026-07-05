@@ -91,6 +91,22 @@ def _draw_calendar(p: QPainter, color: QColor) -> None:
             p.drawPoint(QPointF(cx, cy))
 
 
+def _draw_speed_up(p: QPainter, color: QColor) -> None:
+    # A fast-forward glyph: two right-pointing triangles ("faster").
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QBrush(color))
+    p.drawPolygon(QPolygonF([QPointF(6, 8), QPointF(6, 24), QPointF(15, 16)]))
+    p.drawPolygon(QPolygonF([QPointF(16, 8), QPointF(16, 24), QPointF(26, 16)]))
+
+
+def _draw_speed_down(p: QPainter, color: QColor) -> None:
+    # A rewind glyph: two left-pointing triangles ("slower").
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QBrush(color))
+    p.drawPolygon(QPolygonF([QPointF(26, 8), QPointF(26, 24), QPointF(17, 16)]))
+    p.drawPolygon(QPolygonF([QPointF(16, 8), QPointF(16, 24), QPointF(6, 16)]))
+
+
 _DRAWERS = {
     "pointer": _draw_pointer,
     "rectangle": _draw_rectangle,
@@ -98,6 +114,8 @@ _DRAWERS = {
     "delete": _draw_delete,
     "clock": _draw_clock,
     "calendar": _draw_calendar,
+    "speed_up": _draw_speed_up,
+    "speed_down": _draw_speed_down,
 }
 
 

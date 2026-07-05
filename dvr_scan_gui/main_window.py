@@ -544,7 +544,11 @@ class MainWindow(QMainWindow):
         # between _MIN_SPEED and _MAX_SPEED.
         time_box.addSpacing(16)
 
-        self.speed_down_button = QPushButton("÷2")
+        speed_icon_color = self.palette().color(QPalette.ColorRole.ButtonText)
+
+        self.speed_down_button = QPushButton()
+        self.speed_down_button.setIcon(tool_icon("speed_down", speed_icon_color))
+        self.speed_down_button.setIconSize(QSize(18, 18))
         self.speed_down_button.setFixedWidth(36)
         self.speed_down_button.setToolTip("Halve playback speed.")
         self.speed_down_button.clicked.connect(lambda: self._step_speed(0.5))
@@ -557,7 +561,9 @@ class MainWindow(QMainWindow):
         self.speed_combo.currentIndexChanged.connect(self._on_speed_combo_changed)
         time_box.addWidget(self.speed_combo)
 
-        self.speed_up_button = QPushButton("×2")
+        self.speed_up_button = QPushButton()
+        self.speed_up_button.setIcon(tool_icon("speed_up", speed_icon_color))
+        self.speed_up_button.setIconSize(QSize(18, 18))
         self.speed_up_button.setFixedWidth(36)
         self.speed_up_button.setToolTip("Double playback speed.")
         self.speed_up_button.clicked.connect(lambda: self._step_speed(2.0))
