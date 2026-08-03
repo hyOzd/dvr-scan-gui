@@ -31,6 +31,7 @@ from PySide6.QtGui import (
 from PySide6.QtMultimedia import QAudioOutput, QMediaMetaData, QMediaPlayer
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QButtonGroup,
     QCalendarWidget,
     QCheckBox,
@@ -312,10 +313,11 @@ class MainWindow(QMainWindow):
     def _check_dependencies_on_startup(self) -> None:
         """Surface missing tools at launch.
 
-        A missing *required* tool (dvr-scan) blocks scanning, so the full
-        dependency dialog is opened automatically. Missing *optional* tools
-        (ffprobe) only disable the clock-time features, so they get a status-bar
-        hint pointing at Help ▸ Dependencies rather than an intrusive dialog.
+        A missing *required* tool (dvr-scan) leaves the app unusable, so a
+        *blocking* dependency dialog is opened automatically — the user can only
+        re-check or quit, never dismiss it into a broken state. Missing
+        *optional* tools (ffprobe) only disable the clock-time features, so they
+        get a status-bar hint pointing at Help ▸ Dependencies instead.
         """
         statuses = check_all()
         need = missing_required(statuses)
@@ -326,7 +328,7 @@ class MainWindow(QMainWindow):
                 f"Missing required dependency: {names}. See Help ▸ Dependencies."
             )
             # Defer so the main window paints before the modal dialog appears.
-            QTimer.singleShot(0, self._open_dependencies_dialog)
+            QTimer.singleShot(0, lambda: self._open_dependencies_dialog(blocking=True))
         elif optional:
             names = ", ".join(s.tool.label for s in optional)
             self._set_status(
@@ -334,16 +336,32 @@ class MainWindow(QMainWindow):
                 "See Help ▸ Dependencies."
             )
 
-    def _open_dependencies_dialog(self) -> None:
+    def _open_dependencies_dialog(self, *, blocking: bool = False) -> None:
+        """Show the dependency report.
+
+        Normally (``blocking=False``) this is an informational dialog the user
+        can simply close. In *blocking* mode — used when a required tool is
+        missing at launch — the app cannot function, so the dialog offers only
+        **Check again** and **Quit**; there is no way to dismiss it into a
+        broken state, and closing the window (via the window manager) quits the
+        app as well.
+        """
         dialog = QDialog(self)
         dialog.setWindowTitle("Dependencies")
         dialog.setMinimumWidth(480)
         layout = QVBoxLayout(dialog)
 
-        intro = QLabel(
-            "DVR-Scan GUI relies on the external tools below. Install any that "
-            "are missing, then restart the app."
-        )
+        if blocking:
+            intro_text = (
+                "DVR-Scan GUI needs the required tools below before it can run. "
+                "Install any that are missing, then click Check again."
+            )
+        else:
+            intro_text = (
+                "DVR-Scan GUI relies on the external tools below. Install any "
+                "that are missing, then restart the app."
+            )
+        intro = QLabel(intro_text)
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
@@ -354,11 +372,38 @@ class MainWindow(QMainWindow):
         body.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
         layout.addWidget(body)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
-        buttons.rejected.connect(dialog.reject)
-        buttons.accepted.connect(dialog.accept)
+        buttons = QDialogButtonBox()
+        if blocking:
+            recheck = buttons.addButton(
+                "Check again", QDialogButtonBox.ButtonRole.AcceptRole
+            )
+            buttons.addButton("Quit", QDialogButtonBox.ButtonRole.RejectRole)
+
+            def check_again() -> None:
+                statuses = check_all()
+                body.setText(_dependency_report_html(statuses))
+                if not missing_required(statuses):
+                    # Required tools now present — resume normal operation.
+                    dialog.accept()
+                else:
+                    self._set_status("Required dependencies are still missing.")
+
+            recheck.clicked.connect(check_again)
+            buttons.rejected.connect(dialog.reject)
+        else:
+            close = buttons.addButton(QDialogButtonBox.StandardButton.Close)
+            close.clicked.connect(dialog.reject)
         layout.addWidget(buttons)
-        dialog.exec()
+
+        result = dialog.exec()
+
+        # In blocking mode the only accepting path is a successful re-check.
+        # Anything else — Quit, the window-manager close button, Esc — leaves
+        # required tools missing, so end the app rather than drop the user into
+        # an unusable window. Quitting *after* exec() returns targets the main
+        # event loop (calling it from inside would only exit the modal loop).
+        if blocking and result != QDialog.DialogCode.Accepted:
+            QApplication.quit()
 
     # ---- UI construction --------------------------------------------------
 
